@@ -2,3 +2,24 @@ __pycache__/
 *.py[cod]
 *.log
 .DS_Store
+
+# Local credentials and account state must never be committed.
+.env
+.env.*
+!.env.example
+.codex/
+.claude/
+auth.json
+auth.json.*
+.credentials.json
+.credentials.json.*
+credentials.json
+credentials.json.*
+.claude.json
+.claude.json.*
+/profiles/
+/backups/
+/rotated/
+/selection.json
+/usage-cache.json
+/switch.lock

@@ -12,7 +12,7 @@ What a profile holds (per agent kind):
           identity block out of ~/.claude.json
   codex   ~/.codex/auth.json
 
-Profiles live in HERDR_PLUGIN_STATE_DIR/profiles/<kind>/<slug>.json, 0600 under
+Profiles live in HERDR_PLUGIN_STATE_DIR/profiles/<kind>/<uuid>.json, 0600 under
 a 0700 directory. They are password-equivalent secrets: same value as the files
 they came from, in the same place on the same machine, and never leave it.
 
@@ -23,7 +23,8 @@ Subcommands:
   save     snapshot the current login into a new profile (action)
   status   print what is logged in and what is saved (action)
   stamp    refresh the $acct pane badges (startup hook)
-  switch   switch <kind> <label>  — the scriptable form, for keybindings
+  switch   switch <kind> <uuid|unique-label> — the scriptable form
+  reauth   reauth <kind> <uuid> — replace only this record from the live login
 """
 import base64
 import fcntl
@@ -42,6 +43,7 @@ import urllib.request
 from datetime import datetime
 from email.utils import parsedate_to_datetime
 import time
+import uuid
 
 PLUGIN_ID = os.environ.get("HERDR_PLUGIN_ID", "rcosteira.account-switch")
 HERDR = os.environ.get("HERDR_BIN_PATH", "herdr")
@@ -53,6 +55,7 @@ STATE_DIR = os.environ.get("HERDR_PLUGIN_STATE_DIR") or os.path.expanduser(
 PROFILES_DIR = os.path.join(STATE_DIR, "profiles")
 BACKUP_DIR = os.path.join(STATE_DIR, "backups")
 LOCK = os.path.join(STATE_DIR, "switch.lock")
+SELECTION = os.path.join(STATE_DIR, "selection.json")
 # Where a plugin lives depends on how it was installed: `plugin install` puts it
 # under a `<plugin-id>-<hash>` directory, `plugin link` leaves it where you
 # linked it. The hash is sha256(plugin_id) cut to twelve characters, so an
@@ -345,18 +348,17 @@ def _write_json_secret(path, data, mode=0o600):
             os.remove(tmp)
 
 
-def _slug(text):
-    s = re.sub(r"[^a-z0-9._-]+", "-", (text or "").lower()).strip("-.")
-    return s or "profile"
-
-
 def _fingerprint(identity):
-    """Stable id for "which account is this". Built from the account uuid /
-    email only — never from tokens, which rotate on every refresh."""
-    key = identity.get("account_id") or identity.get("email")
-    if not key:
+    """Provider identity guard, never a registration key or deduplication key.
+
+    Codex's account_id can name a shared workspace; include the person too.
+    """
+    account = identity.get("account_id")
+    person = identity.get("user_id") or identity.get("email")
+    if not account and not person:
         return None
-    return hashlib.sha256(str(key).encode()).hexdigest()[:16]
+    key = json.dumps([account, person], sort_keys=True)
+    return hashlib.sha256(key.encode()).hexdigest()[:16]
 
 
 def _jwt_claims(token):
@@ -564,6 +566,8 @@ class CodexBackend(Backend):
         return {
             "email": claims.get("email"),
             "account_id": account_id,
+            "user_id": openai.get("chatgpt_user_id") or openai.get("user_id")
+                       or claims.get("sub"),
             "org": None,
             "plan": openai.get("chatgpt_plan_type") or auth.get("auth_mode"),
         }
@@ -587,72 +591,152 @@ def kind_of_agent(info):
 # ---- profile store --------------------------------------------------------
 
 def _kind_dir(kind):
+    if kind not in BACKENDS:
+        raise SwitchError("unknown account kind")
     return os.path.join(PROFILES_DIR, kind)
 
 
+def _valid_uuid(value):
+    try:
+        return isinstance(value, str) and str(uuid.UUID(value)) == value
+    except (ValueError, TypeError, AttributeError):
+        return False
+
+
+def _storage_name(value):
+    # Legacy filenames stay in place. Never accept a path from profile JSON.
+    if (not isinstance(value, str) or value in (".", "..")
+            or not re.fullmatch(r"[a-zA-Z0-9._-]+", value)):
+        raise SwitchError("invalid profile filename")
+    return value
+
+
 def list_profiles(kind):
-    """Saved profiles for a kind, oldest-saved first (that's the cycle order)."""
+    """Read records without migrating files or looking up provider identities."""
     out = []
     try:
         names = sorted(os.listdir(_kind_dir(kind)))
     except OSError:
         return out
     for name in names:
-        if not name.endswith(".json"):
+        if not name.endswith(".json") or os.path.islink(os.path.join(_kind_dir(kind), name)):
             continue
         data = _read_json(os.path.join(_kind_dir(kind), name))
         if isinstance(data, dict) and data.get("payload"):
-            data.setdefault("slug", name[:-5])
+            try:
+                data["slug"] = _storage_name(name[:-5])
+            except SwitchError:
+                continue
+            data["kind"] = kind
+            if "id" not in data:
+                # Compatibility for existing files only: a local filename,
+                # not email/workspace/provider id, gives a stable UUID.
+                data["id"] = str(uuid.uuid5(uuid.NAMESPACE_URL,
+                    "account-hub/profile/" + kind + "/" + data["slug"]))
+            if not _valid_uuid(data["id"]):
+                continue
             data.setdefault("label", data["slug"])
+            data["identity"] = BACKENDS[kind].identity(data["payload"])
+            data["fingerprint"] = _fingerprint(data["identity"])
             out.append(data)
-    out.sort(key=lambda p: (p.get("saved_at") or 0, p["slug"]))
+    out.sort(key=lambda p: (p.get("created_at") or p.get("saved_at") or 0, p["id"]))
     return out
 
 
 def get_profile(kind, key):
-    """Look a profile up by slug or (case-insensitive) label."""
-    for p in list_profiles(kind):
-        if key in (p["slug"], p["label"]) or key.lower() == p["label"].lower():
+    """UUID first; labels and legacy filenames must be unambiguous."""
+    profiles = list_profiles(kind)
+    for p in profiles:
+        if key == p["id"]:
             return p
-    return None
+    if not isinstance(key, str):
+        return None
+    matches = [p for p in profiles if key == p["slug"]
+               or key.casefold() == str(p["label"]).casefold()]
+    if len(matches) > 1:
+        raise SwitchError(f"ambiguous {kind} profile label {key!r}; use its UUID")
+    return matches[0] if matches else None
+
+
+def _profile_by_id(kind, profile_id):
+    if not _valid_uuid(profile_id):
+        raise SwitchError("an explicit profile UUID is required")
+    profile = next((p for p in list_profiles(kind) if p["id"] == profile_id), None)
+    if profile is None:
+        raise SwitchError(f"no {kind} profile with UUID {profile_id!r}")
+    return profile
 
 
 def write_profile(profile):
-    _secure_dir(PROFILES_DIR)
-    _secure_dir(_kind_dir(profile["kind"]))
-    path = os.path.join(_kind_dir(profile["kind"]), profile["slug"] + ".json")
-    _write_json_secret(path, profile)
+    if not _valid_uuid(profile.get("id")):
+        raise SwitchError("profile needs a UUID")
+    filename = _storage_name(profile["slug"])
+    with _Lock():
+        _secure_dir(PROFILES_DIR)
+        _secure_dir(_kind_dir(profile["kind"]))
+        path = os.path.join(_kind_dir(profile["kind"]), filename + ".json")
+        _write_json_secret(path, profile)
     return path
 
 
-def delete_profile(kind, slug):
-    try:
-        os.remove(os.path.join(_kind_dir(kind), slug + ".json"))
+def _selection():
+    value = _read_json(SELECTION)
+    return value if isinstance(value, dict) else {}
+
+
+def _select_profile(kind, profile_id):
+    with _Lock():
+        selected = _selection()
+        if profile_id is None:
+            selected.pop(kind, None)
+        else:
+            _profile_by_id(kind, profile_id)
+            selected[kind] = profile_id
+        _write_json_secret(SELECTION, selected)
+
+
+def _forget_profile_usage(kind, profile_id):
+    cache = _usage_cache()
+    if cache.pop(f"{kind}:{profile_id}", None) is not None:
+        _write_json_secret(USAGE_CACHE, cache)
+
+
+def delete_profile(kind, profile_id):
+    with _Lock():
+        try:
+            profile = _profile_by_id(kind, profile_id)
+            os.remove(os.path.join(_kind_dir(kind), profile["slug"] + ".json"))
+        except (OSError, SwitchError):
+            return False
+        if _selection().get(kind) == profile_id:
+            _select_profile(kind, None)
+        _forget_profile_usage(kind, profile_id)
+        _clear_staged(kind, profile_id)
+        if profile["slug"] != profile_id:
+            _clear_staged(kind, profile["slug"])
         return True
-    except OSError:
-        return False
 
 
-def _unique_slug(kind, label):
-    base = _slug(label)
-    slug, n = base, 2
-    existing = {p["slug"] for p in list_profiles(kind)}
-    while slug in existing:
-        slug = f"{base}-{n}"
-        n += 1
-    return slug
+def rename_profile(kind, profile_id, label):
+    with _Lock():
+        profile = _profile_by_id(kind, profile_id)
+        profile["label"] = label
+        write_profile(profile)
 
 
 def make_profile(kind, label, payload):
     backend = BACKENDS[kind]
     identity = backend.identity(payload)
+    profile_id = str(uuid.uuid4())
     return {
         "kind": kind,
-        "slug": _unique_slug(kind, label),
+        "id": profile_id,
+        "slug": profile_id,
         "label": label,
         "identity": identity,
         "fingerprint": _fingerprint(identity),
         "saved_at": int(time.time()),
+        "created_at": time.time(),
         "last_used": None,
         "payload": payload,
     }
@@ -667,18 +751,45 @@ def default_label(kind, identity):
     return f"{kind}-{int(time.time())}"
 
 
+def _same_login(kind, profile, live):
+    """Guard a selected record against an unrelated external login.
+
+    Session claims are optional. Without them, Codex needs a token still in
+    common; otherwise explicit reauth is safer than guessing who to overwrite.
+    """
+    backend = BACKENDS[kind]
+    saved = profile.get("payload") or {}
+    fp = _fingerprint(backend.identity(live)) if live else None
+    if not fp or fp != _fingerprint(backend.identity(saved)):
+        return False
+    if kind != "codex" or saved == live:
+        return True
+    old = (saved.get("auth") or {}).get("tokens") or {}
+    new = (live.get("auth") or {}).get("tokens") or {}
+    markers = []
+    for field in ("id_token", "access_token"):
+        a, b = _jwt_claims(old.get(field, "")), _jwt_claims(new.get(field, ""))
+        for claim in ("sid", "auth_time"):
+            if claim in a or claim in b:
+                if a.get(claim) != b.get(claim):
+                    return False
+                markers.append(claim)
+    return bool(markers) or any(old.get(k) and old[k] == new.get(k)
+                                for k in ("access_token", "refresh_token"))
+
+
 def active_profile(kind, live=None):
-    """The saved profile matching the live login, or None."""
+    """The explicitly selected UUID, provided its login is still live."""
     backend = BACKENDS[kind]
     if live is None:
         live = backend.read_live()
     if live is None:
         return None
-    fp = _fingerprint(backend.identity(live))
-    if not fp:
+    profile_id = _selection().get(kind)
+    if not _valid_uuid(profile_id):
         return None
     for p in list_profiles(kind):
-        if p.get("fingerprint") == fp:
+        if p["id"] == profile_id and _same_login(kind, p, live):
             return p
     return None
 
@@ -709,11 +820,10 @@ def switch(kind, key):
             raise SwitchError(f"no {kind} profile named {key!r}")
 
         live = backend.read_live()
-        live_fp = None
-        if live is not None:
-            live_fp = _fingerprint(backend.identity(live))
-            if live_fp and live_fp == target.get("fingerprint"):
-                return f"{kind}: already on {target['label']}"
+        outgoing = active_profile(kind, live) if live is not None else None
+        if outgoing is not None and outgoing["id"] == target["id"]:
+            sync_live_profile(kind, live)
+            return f"{kind}: already on {target['label']}"
 
         # Prove the saved login still works before overwriting a working one.
         # This can rotate the target's tokens, so keep what it hands back: the
@@ -723,10 +833,6 @@ def switch(kind, key):
 
         if live is not None:
             # Never overwrite a login we don't have a copy of.
-            outgoing = next(
-                (p for p in list_profiles(kind) if p.get("fingerprint") == live_fp),
-                None,
-            )
             if outgoing is None:
                 ident = backend.identity(live)
                 rescued = make_profile(kind, "autosaved-" + default_label(kind, ident), live)
@@ -742,24 +848,30 @@ def switch(kind, key):
                 write_profile(outgoing)
             _backup(kind, live)
 
-        backend.write_live(target["payload"])
+        try:
+            backend.write_live(target["payload"])
 
-        # Verify, and put the previous login back if the store didn't take.
-        check = backend.read_live()
-        got = _fingerprint(backend.identity(check)) if check else None
-        if target.get("fingerprint") and got != target["fingerprint"]:
+            # Compare credentials too: equal provider identities do not prove
+            # that the requested record's authentication was installed.
+            check = backend.read_live()
+            wanted = target["payload"]
+            credential_key = "auth" if kind == "codex" else "credentials"
+            got = _fingerprint(backend.identity(check)) if check else None
+            if (not check or got != _fingerprint(backend.identity(wanted))
+                    or check.get(credential_key) != wanted.get(credential_key)):
+                raise SwitchError(f"{kind}: write did not take; previous login restored")
+            target["identity"] = backend.identity(wanted)
+            target["fingerprint"] = _fingerprint(target["identity"])
+            target["last_used"] = int(time.time())
+            write_profile(target)
+            _select_profile(kind, target["id"])
+        except (SwitchError, OSError):
             if live is not None:
                 try:
                     backend.write_live(live)
-                except SwitchError:
+                except (SwitchError, OSError):
                     pass
-            raise SwitchError(
-                f"{kind}: write did not take (store still reports a different "
-                f"account); previous login restored"
-            )
-
-        target["last_used"] = int(time.time())
-        write_profile(target)
+            raise
 
     stamp_badges()
     ident = backend.describe(target.get("identity") or {})
@@ -772,13 +884,13 @@ def next_profile(kind):
     if not profiles:
         raise SwitchError(f"no saved {kind} profiles yet — run the save action first")
     if len(profiles) == 1:
-        return switch(kind, profiles[0]["slug"])
+        return switch(kind, profiles[0]["id"])
     current = active_profile(kind)
     idx = 0
     if current:
-        slugs = [p["slug"] for p in profiles]
-        idx = (slugs.index(current["slug"]) + 1) % len(profiles)
-    return switch(kind, profiles[idx]["slug"])
+        ids = [p["id"] for p in profiles]
+        idx = (ids.index(current["id"]) + 1) % len(profiles)
+    return switch(kind, profiles[idx]["id"])
 
 
 # ---- usage ----------------------------------------------------------------
@@ -1127,9 +1239,14 @@ def renew_profile(kind, profile, force=False):
     server is the authority, so a 401 asks for this.
     """
     with _Lock():
-        current = get_profile(kind, profile["slug"]) or profile
-        slug = current["slug"]
-        payload = _adopt_staged(kind, slug, current.get("payload") or {})
+        current = _profile_by_id(kind, profile["id"])
+        slug = current["id"]
+        # A legacy sidecar can be the only surviving rotated token. Adopt it
+        # on this record's normal renewal; do not bulk-migrate credential files.
+        original = current.get("payload") or {}
+        if current["slug"] != slug:
+            original = _adopt_staged(kind, current["slug"], original)
+        payload = _adopt_staged(kind, slug, original)
         if kind == "claude":
             creds = payload.get("credentials")
             if isinstance(creds, str):
@@ -1171,6 +1288,8 @@ def renew_profile(kind, profile, force=False):
         current["saved_at"] = int(time.time())
         write_profile(current)
         _clear_staged(kind, slug)
+        if current["slug"] != slug:
+            _clear_staged(kind, current["slug"])
     return payload
 
 
@@ -1242,7 +1361,7 @@ def proven_payload(kind, profile):
     if not VERIFY_SWITCH:
         return payload
     label = profile.get("label") or profile.get("slug") or kind
-    key = "%s:%s" % (kind, profile["slug"])
+    key = "%s:%s" % (kind, profile["id"])
     try:
         payload = renew_profile(kind, profile) or payload
         try:
@@ -1344,10 +1463,10 @@ def _usage_rows(kinds=None, refresh=True):
         # picker, panel and `list`, so it is where the saved copy stays current
         # without waiting for a switch.
         sync_live_profile(kind, live)
-        live_fp = _fingerprint(backend.identity(live)) if live else None
+        current = active_profile(kind, live) if live else None
         for profile in list_profiles(kind):
-            key = "%s:%s" % (kind, profile["slug"])
-            is_live = bool(live_fp) and profile.get("fingerprint") == live_fp
+            key = "%s:%s" % (kind, profile["id"])
+            is_live = current is not None and profile["id"] == current["id"]
             payload = live if is_live else profile.get("payload")
             windows, state, problem = None, "unknown", None
             entry = cache.get(key) or {}
@@ -1402,6 +1521,7 @@ def _usage_rows(kinds=None, refresh=True):
                 windows, at = [], None
             rows.append({
                 "kind": kind,
+                "id": profile["id"],
                 "slug": profile["slug"],
                 "label": profile["label"],
                 "active": is_live,
@@ -1467,7 +1587,7 @@ def account_labels(kinds=None, include_usage=False):
         if current:
             labels[kind] = current["label"]
             if include_usage:
-                entry = _usage_cache().get("%s:%s" % (kind, current["slug"])) or {}
+                entry = _usage_cache().get("%s:%s" % (kind, current["id"])) or {}
                 window = badge_window(entry)
                 if window:
                     stale = (not entry.get("at") or usage_notice(entry)
@@ -1523,16 +1643,9 @@ def _clear_badge(pane_id):
 
 
 def sync_live_profile(kind, live=None):
-    """Bring the saved copy of the live account up to date. True if it moved.
-
-    The CLI renews the live tokens continuously, and a fresh `codex login`
-    replaces them outright. Only a switch used to copy that back, so a profile
-    could sit on a credential the provider had already retired while the live
-    one beside it worked — and the next switch would install the dead copy.
-
-    Cheap enough to call on any invocation: it compares what is already read
-    against what is on disk and writes only on a difference. Nothing is created
-    here — an account nobody saved stays unsaved, which is `save`'s job.
+    """Sync token rotation only into the selected UUID. Never discover or
+    replace a record by provider id, workspace or email. Fresh Codex sessions
+    require explicit reauth; registration always appends a new record.
     """
     backend = BACKENDS.get(kind)
     if backend is None:
@@ -1544,17 +1657,13 @@ def sync_live_profile(kind, live=None):
             return False
     if live is None:
         return False
-    identity = backend.identity(live)
-    fingerprint = _fingerprint(identity)
-    if not fingerprint:
-        return False
     with _Lock():
-        profile = next((p for p in list_profiles(kind)
-                        if p.get("fingerprint") == fingerprint), None)
+        profile = active_profile(kind, live)
         if profile is None or profile.get("payload") == live:
             return False
         profile["payload"] = live
-        profile["identity"] = identity
+        profile["identity"] = backend.identity(live)
+        profile["fingerprint"] = _fingerprint(profile["identity"])
         profile["saved_at"] = int(time.time())
         write_profile(profile)
     return True
@@ -1665,7 +1774,7 @@ def cmd_next(argv):
 
 def cmd_switch(argv):
     if len(argv) < 2:
-        raise SwitchError("usage: switcher.py switch <claude|codex> <label>")
+        raise SwitchError("usage: switcher.py switch <claude|codex> <uuid|unique-label>")
     kind = resolve_kind(argv[0])
     print(switch(kind, argv[1]))
     return 0
@@ -1679,17 +1788,41 @@ def save_live(kind, label=None):
         if live is None:
             raise SwitchError(f"{kind}: nothing logged in to save")
         identity = backend.identity(live)
-        fp = _fingerprint(identity)
-        existing = next(
-            (p for p in list_profiles(kind) if fp and p.get("fingerprint") == fp), None
-        )
-        if existing:
-            return (f"{kind}: already saved as {existing['label']} "
-                    f"(rename it with r in the picker)")
         profile = make_profile(kind, label or default_label(kind, identity), live)
         write_profile(profile)
+        _select_profile(kind, profile["id"])
     stamp_badges()
-    return f"{kind}: saved {profile['label']} ({backend.describe(profile['identity'])})"
+    return (f"{kind}: saved {profile['label']} [{profile['id']}] "
+            f"({backend.describe(profile['identity'])})")
+
+
+def reauthenticate(kind, profile_id):
+    """Capture an official CLI login into exactly the UUID requested."""
+    backend = BACKENDS[kind]
+    with _Lock():
+        profile = _profile_by_id(kind, profile_id)
+        live = backend.read_live()
+        if live is None:
+            raise SwitchError(f"{kind}: nothing logged in to capture; log in with the CLI first")
+        profile["payload"] = live
+        profile["identity"] = backend.identity(live)
+        profile["fingerprint"] = _fingerprint(profile["identity"])
+        profile["saved_at"] = int(time.time())
+        write_profile(profile)
+        _clear_staged(kind, profile_id)
+        if profile["slug"] != profile_id:
+            _clear_staged(kind, profile["slug"])
+        _forget_profile_usage(kind, profile_id)
+        _select_profile(kind, profile_id)
+    stamp_badges()
+    return f"{kind}: reauthenticated {profile['label']} [{profile_id}]"
+
+
+def cmd_reauth(argv):
+    if len(argv) != 2:
+        raise SwitchError("usage: switcher.py reauth <claude|codex> <uuid>")
+    print(reauthenticate(resolve_kind(argv[0]), argv[1]))
+    return 0
 
 
 def cmd_save(argv):
@@ -1718,18 +1851,16 @@ def cmd_status(argv):
         if not backend.present() and not profiles:
             continue
         live = backend.read_live()
+        active = active_profile(kind, live) if live else None
         if live is None:
             current = "not logged in"
         else:
-            active = active_profile(kind, live)
             desc = backend.describe(backend.identity(live))
             current = f"{active['label']} ({desc})" if active else f"unsaved ({desc})"
         print(f"{backend.title:<12} {current}")
         for p in profiles:
-            mark = "*" if live is not None and p.get("fingerprint") == _fingerprint(
-                backend.identity(live)
-            ) else " "
-            print(f"  {mark} {p['label']:<16} {backend.describe(p.get('identity') or {})}")
+            mark = "*" if active is not None and p["id"] == active["id"] else " "
+            print(f"  {mark} {p['label']:<16} [{p['id']}] {backend.describe(p.get('identity') or {})}")
         if not profiles:
             print("    (no profiles saved — run the save action)")
     return 0
@@ -1750,16 +1881,17 @@ def cmd_list(argv):
     if not kinds:
         print(json.dumps([]))
         return 0
-    profiles = {(kind, p["slug"]): p
+    profiles = {(kind, p["id"]): p
                 for kind in kinds for p in list_profiles(kind)}
     out = []
     # usage_rows walks the same kinds and profiles in the same order, and works
     # out which one is live once per kind, so it is the row source rather than
     # a second pass beside one.
     for row in usage_rows(kinds, refresh=False):
-        profile = profiles.get((row["kind"], row["slug"])) or {}
+        profile = profiles.get((row["kind"], row["id"])) or {}
         out.append({
             "kind": row["kind"],
+            "id": row["id"],
             "slug": row["slug"],
             "label": row["label"],
             "active": row["active"],
@@ -1972,7 +2104,7 @@ def _badge_refresh_due(kinds):
         profile = active_profile(kind, live) if live else None
         if not profile:
             continue
-        key = "%s:%s" % (kind, profile["slug"])
+        key = "%s:%s" % (kind, profile["id"])
         entry = cache.get(key) or {}
         last = max(entry.get("at") or 0, entry.get("badge_attempt_at") or 0)
         if now - last > USAGE_TTL_S and now >= (entry.get("retry_after") or 0):
@@ -2051,15 +2183,15 @@ def _rows():
         if not backend.present() and not profiles:
             continue
         live = backend.read_live()
-        live_fp = _fingerprint(backend.identity(live)) if live else None
+        current = active_profile(kind, live) if live else None
         head = backend.title
         if live is None:
             head += "  — not logged in"
-        elif not any(p.get("fingerprint") == live_fp for p in profiles):
+        elif current is None:
             head += f"  — live: {backend.describe(backend.identity(live))} (unsaved, press s)"
         rows.append(("head", kind, head))
         for p in profiles:
-            p["_active"] = bool(live_fp) and p.get("fingerprint") == live_fp
+            p["_active"] = current is not None and p["id"] == current["id"]
             rows.append(("profile", kind, p))
         if not profiles:
             rows.append(("empty", kind, "  (nothing saved — press s to save the current login)"))
@@ -2443,15 +2575,15 @@ def cmd_ui(argv):
         details = False
         # Poll only at the cache interval; usage_rows also observes each
         # account's Retry-After, including while this picker stays open.
-        usage = {"%s:%s" % (r["kind"], r["slug"]): r for r in usage_rows()}
+        usage = {"%s:%s" % (r["kind"], r["id"]): r for r in usage_rows()}
         usage_fetched = time.time()
         while True:
             if time.time() - usage_fetched >= USAGE_TTL_S:
-                usage = {"%s:%s" % (r["kind"], r["slug"]): r for r in usage_rows()}
+                usage = {"%s:%s" % (r["kind"], r["id"]): r for r in usage_rows()}
                 usage_fetched = time.time()
             else:
                 # Another switcher pane may already have fetched newer usage.
-                usage = {"%s:%s" % (r["kind"], r["slug"]): r
+                usage = {"%s:%s" % (r["kind"], r["id"]): r
                          for r in usage_rows(refresh=False)}
             rows = _rows()
             pickable = [
@@ -2468,7 +2600,7 @@ def cmd_ui(argv):
                 # leaves whatever the longer version wrote behind it.
                 stdscr.addnstr(
                     1, 0,
-                    ("j/k select · enter switch · s save · r rename · x delete · "
+                    ("j/k select · enter switch · s save · a reauth · r rename · x delete · "
                      "d %s · u reread · q quit"
                      % ("hide" if details else "details")).ljust(w - 1),
                     w - 1, curses.A_DIM,
@@ -2494,7 +2626,7 @@ def cmd_ui(argv):
                     stdscr.addnstr(y, 0, body.ljust(w - 1), w - 1, attr)
                 else:
                     is_sel = pickable and i == pickable[sel]
-                    row = usage.get("%s:%s" % (kind, body["slug"]))
+                    row = usage.get("%s:%s" % (kind, body["id"]))
                     # Expanded, the windows below carry the numbers, so the
                     # account line would only repeat one of them.
                     text, sev = ("", "ok") if details else usage_summary(row)
@@ -2544,7 +2676,7 @@ def cmd_ui(argv):
                 sel = max(0, sel - 1)
             elif ch in (curses.KEY_ENTER, 10, 13) and selected:
                 try:
-                    message = switch(selected[1], selected[2]["slug"])
+                    message = switch(selected[1], selected[2]["id"])
                 except SwitchError as exc:
                     message = str(exc)
             elif ch == ord("s") and kind:
@@ -2568,19 +2700,30 @@ def cmd_ui(argv):
                 )
                 if name:
                     profile = selected[2]
-                    delete_profile(profile["kind"], profile["slug"])
-                    profile["label"] = name
-                    profile["slug"] = _unique_slug(profile["kind"], name)
-                    profile.pop("_active", None)
-                    write_profile(profile)
-                    message = f"renamed to {name}"
+                    try:
+                        rename_profile(profile["kind"], profile["id"], name)
+                        message = f"renamed to {name}"
+                    except SwitchError as exc:
+                        message = str(exc)
+            elif ch == ord("a") and selected:
+                profile = selected[2]
+                live = BACKENDS[profile["kind"]].read_live()
+                desc = (BACKENDS[profile["kind"]].describe(
+                    BACKENDS[profile["kind"]].identity(live)) if live else "logged out")
+                if _confirm(stdscr, "Reauthenticate profile",
+                            f"Replace credentials for {profile['label']}?",
+                            f"Capture current login: {desc}"):
+                    try:
+                        message = reauthenticate(profile["kind"], profile["id"])
+                    except SwitchError as exc:
+                        message = str(exc)
             elif ch == ord("d"):
                 details = not details
             elif ch == ord("u"):
                 message = "reading usage…"
                 stdscr.addnstr(h - 1, 0, message.ljust(w - 1), w - 1, curses.A_BOLD)
                 stdscr.refresh()
-                usage = {"%s:%s" % (r["kind"], r["slug"]): r for r in usage_rows()}
+                usage = {"%s:%s" % (r["kind"], r["id"]): r for r in usage_rows()}
                 usage_fetched = time.time()
                 stale = [r["label"] for r in usage.values() if r["state"] != "live"]
                 message = ("usage read" if not stale
@@ -2596,7 +2739,7 @@ def cmd_ui(argv):
                     stdscr, "Delete profile",
                     f"Delete {profile['label']}?", note,
                 ):
-                    delete_profile(profile["kind"], profile["slug"])
+                    delete_profile(profile["kind"], profile["id"])
                     message = f"deleted {profile['label']}"
                     sel = max(0, sel - 1)
 
@@ -2899,7 +3042,7 @@ def cmd_disable_badge(argv):
 # a refusal has to say so on screen the way a completed switch already does.
 # Nothing polled belongs here: `badge` runs once a second from the tab bar, and
 # a toast per tick would be worse than the silence it replaces.
-NOTIFY_FAILURE = {"next": "switch", "switch": "switch", "save": "save"}
+NOTIFY_FAILURE = {"next": "switch", "switch": "switch", "save": "save", "reauth": "reauth"}
 
 DISPATCH = {
     "ui": cmd_ui,
@@ -2909,6 +3052,7 @@ DISPATCH = {
     "next": cmd_next,
     "switch": cmd_switch,
     "save": cmd_save,
+    "reauth": cmd_reauth,
     "status": cmd_status,
     "stamp": cmd_stamp,
     "badge": cmd_badge,

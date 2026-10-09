@@ -14,7 +14,9 @@ has been billing.
 ## What it does
 
 - **Named profiles** per agent kind. A profile is a snapshot of the credential
-  store the CLI actually reads.
+  store the CLI actually reads, identified by its own local UUID. Every save
+  creates a new record, even for the same email, provider identity or workspace.
+  Three people in the same Team workspace remain three independent records.
 - **Switch** from an overlay picker, or cycle to the next account with one
   keybinding — no UI, no prompt.
 - Both CLIs re-read their credential store on every request, so **agents that
@@ -52,6 +54,11 @@ herdr plugin action invoke save --plugin rcosteira.account-switch
 That snapshots whatever is logged in right now. Log into the other account the
 normal way (`claude` → `/login`, or `codex login`), run `save` again, and you
 have two profiles to switch between.
+
+The selected profile is stored by UUID, separately from its credentials. Email,
+user ID and workspace ID are metadata, never keys for replacing a registration.
+Duplicate names are allowed; use the UUID printed by `save`, `status` or `list`
+when a name is ambiguous. Renaming keeps the UUID and credential file unchanged.
 
 ### Config (`~/.config/herdr/config.toml`)
 
@@ -333,6 +340,7 @@ The overlay and the `--color` text form read the same palette, so they agree.
 j / k or ↓ / ↑   move selection
 enter            switch to the selected account
 s                save the current login as a new profile (prompts for a name)
+a                capture the current CLI login into the selected profile (confirms)
 r                rename the selected profile
 x                delete the selected profile, including the one in use
 d                show / hide every usage window, not just the short one
@@ -428,14 +436,16 @@ Press `d` to see the reading's age and refresh error. Refresh respects the
 cache lifetime and the provider's `Retry-After` delay, falling back to five
 minutes when no usable delay is supplied.
 
-`s`, `r` and `x` each open a dialog in the middle of the screen. Deleting removes
+`s`, `a`, `r` and `x` each open a dialog in the middle of the screen. Deleting removes
 this plugin's saved copy of a login and nothing else: the credential store the
 CLI reads is never touched, so you stay logged in. Delete the profile for the
 account you are on and the next switch away re-saves it under an `autosaved-…`
 name.
 
-`●` marks the account that is live. A section header reading *"live: … (unsaved,
-press s)"* means you are logged into something the plugin has no copy of yet.
+`●` marks the selected UUID whose login is live. A section header reading
+*"live: … (unsaved, press s)"* means the live login is not associated with a
+selected record. Press `s` to register it, or `a` on an existing record to
+explicitly replace that record's authentication.
 
 ## What it reads and writes
 
@@ -448,10 +458,30 @@ press s)"* means you are logged into something the plugin has no copy of yet.
 **only** the `oauthAccount` key of `~/.claude.json` is touched — projects,
 history and onboarding state are rewritten verbatim.
 
-Profiles live in `HERDR_PLUGIN_STATE_DIR/profiles/<kind>/<slug>.json`, mode
-`0600` inside a `0700` directory. They are password-equivalent: the same
-secrets that were already on the disk, in the same account, on the same
-machine, and they never leave it.
+New profiles live in `HERDR_PLUGIN_STATE_DIR/profiles/<kind>/<uuid>.json`, mode
+`0600` inside a `0700` directory. They contain email/provider metadata and
+password-equivalent credentials. `selection.json` stores the selected UUID per
+kind; usage caches and rotating-token sidecars are keyed by UUID too.
+
+Existing profiles can be read in place without moving or copying their files.
+Their local filenames supply stable compatibility UUIDs, independently of
+provider identities. No record is selected by matching an email or workspace;
+select an existing profile explicitly. The UUID is persisted when that record
+is next written. Sessions, conversation history and terminal titles are outside
+the registration and reauthentication workflow.
+
+### Repository privacy
+
+With no state-directory override, private data lives outside this checkout at
+`~/.local/state/herdr/plugins/rcosteira.account-switch/`. Its `profiles/`,
+`backups/` and `rotated/` directories all contain credentials. The live Codex
+login remains in `~/.codex/auth.json` (or `$CODEX_HOME/auth.json`). These files
+are not source code and must not be published.
+
+The repository's `.gitignore` also excludes local credential files, `.env`
+files, and account-state directories copied into the checkout. Ignore rules do
+not remove files already committed or protect secrets pasted into tracked code.
+Tests use temporary directories and fictitious logins only.
 
 ## Not losing a login
 
@@ -469,7 +499,7 @@ you something, so every switch:
    turning the refresh token down in words. Being offline, timing out and
    getting rate limited prove nothing either way, and none of them block a
    switch. Set `verify_switch = false` to skip the check;
-3. **auto-saves the outgoing login** if it isn't in any profile yet — you can
+3. **auto-saves the outgoing login** if it isn't associated with a selected UUID — you can
    never overwrite an account the plugin doesn't already have a copy of — and
    **refreshes its snapshot** if it is. The CLI keeps renewing the live tokens,
    so a profile saved hours ago holds older ones; parking the account without
@@ -549,7 +579,7 @@ command, which is why they are the easy place to restyle the badge.
 
 ## What the providers do to your logins
 
-### The live account's copy stays current on its own
+### Rotation updates the selected UUID; reauthentication is explicit
 
 A switch is not the only moment the live tokens change. The CLI renews them as
 it works, and `claude login` or `codex login` replaces them outright. Waiting
@@ -557,14 +587,23 @@ for a switch to copy that back left a profile holding a credential the provider
 had already retired, while the live one beside it worked — and the next switch
 would install the dead copy.
 
-So any read of the accounts — the picker, the usage panel, `list`, `usage` —
-compares the live login against its saved copy and rewrites the copy when they
-differ. It costs no network and writes nothing when they match. **Logging an
-account in again is therefore enough on its own**; there is no save to remember,
-and `save` would refuse anyway, since that account is already a profile.
+Reads of the accounts sync token rotation only into the explicitly selected
+UUID, after checking provider identity. For Codex, session claims or a token
+still in common must also associate the live login with that record. If the
+association cannot be established, no registration is updated automatically.
+Other registrations remain untouched, including duplicates of the same identity.
 
-Nothing is created this way. An account no profile holds stays unsaved, which is
-what `save` is for.
+After an official CLI login, choose which record to update: select it in the
+picker and press `a`, or run:
+
+```sh
+python3 switcher.py reauth codex <profile-uuid>
+```
+
+This captures the current login into only that UUID, preserves its name and
+creation time, clears its old usage/staged tokens, and selects it. It does not
+launch login or change the live credential store. `reauth` rejects labels and
+requires an existing UUID. `save` always registers a new UUID instead.
 
 A renewal counts as a change too: renewing a parked profile's tokens moves its
 `saved_at`, so anything watching that field can tell the credential was
@@ -587,7 +626,7 @@ The picker prints a refusal on its own status line. Every other path only wrote
 it to stderr, and herdr drops that. The failure then read as "the badge did not
 change", with nothing saying why.
 
-`next`, `switch` and `save` now send the reason as a herdr notification. A
+`next`, `switch`, `save` and `reauth` send the reason as a herdr notification. A
 completed switch already sent one, so the two match. `ACCOUNT_SWITCH_NOTIFY=0`
 turns both off. Nothing polled sends one: `badge` runs once a second from the
 tab bar, and a notification per tick would be worse than the silence.

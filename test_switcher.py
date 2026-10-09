@@ -14,9 +14,11 @@ import os
 import shutil
 import signal
 import sys
+import subprocess
 import tempfile
 import time
 import urllib.error
+from pathlib import Path
 
 STATE = tempfile.mkdtemp(prefix="account-switch-test-")
 os.environ["HERDR_PLUGIN_STATE_DIR"] = STATE
@@ -103,13 +105,27 @@ def reset(target_payload=None):
     fake = FakeBackend()
     fake.store = claude_payload("LIVE", "live-access", "live-refresh", expired=False)
     S.BACKENDS["claude"] = fake
-    S.write_profile(S.make_profile("claude", "Live", dict(fake.store)))
+    try:
+        os.remove(S.SELECTION)
+    except FileNotFoundError:
+        pass
+    live_profile = S.make_profile("claude", "Live", dict(fake.store))
+    S.write_profile(live_profile)
+    S._select_profile("claude", live_profile["id"])
     S.write_profile(S.make_profile(
         "claude", "Target",
         target_payload or claude_payload("TARGET", "old-access", "r1")))
     S.stamp_badges = lambda *a, **k: None
     S.notify = lambda *a, **k: None
     return fake
+
+
+def profile_id(label):
+    return S.get_profile("claude", label)["id"]
+
+
+def cache_key(label):
+    return "claude:" + profile_id(label)
 
 
 def switch():
@@ -388,47 +404,48 @@ def tab_badge():
 
 
 check("missing usage keeps the name", tab_badge() == "👤 Live", tab_badge())
-S._remember_usage("claude:target", [{"label": "session", "percent": 99}])
+S._remember_usage(cache_key("Target"), [{"label": "session", "percent": 99}])
 check("another account's usage is never borrowed", tab_badge() == "👤 Live", tab_badge())
-S._remember_usage("claude:live", [
+S._remember_usage(cache_key("Live"), [
     {"label": "session", "percent": 42, "window_seconds": 18000},
     {"label": "weekly", "percent": 18, "window_seconds": 604800},
 ])
 check("the session window follows the name", tab_badge() == "👤 Live 42%", tab_badge())
 check("pane labels keep their existing format", S.account_labels(["claude"]) == {"claude": "Live"})
 cache = S._usage_cache()
-cache["claude:live"]["at"] = time.time() - S.USAGE_TTL_S - 1
+cache[cache_key("Live")]["at"] = time.time() - S.USAGE_TTL_S - 1
 S._write_json_secret(S.USAGE_CACHE, cache)
 check("old readings carry a tilde", tab_badge() == "👤 Live ~42%", tab_badge())
-S._remember_usage("claude:live", [{"label": "weekly", "percent": 67}])
+S._remember_usage(cache_key("Live"), [{"label": "weekly", "percent": 67}])
 check("missing session usage keeps only the name", tab_badge() == "👤 Live", tab_badge())
-S._remember_usage("claude:live", [{"label": "session", "percent": 0}])
+S._remember_usage(cache_key("Live"), [{"label": "session", "percent": 0}])
 check("zero usage is shown", tab_badge() == "👤 Live 0%", tab_badge())
-S._rest_usage("claude:live", 300)
+S._rest_usage(cache_key("Live"), 300)
 check("a cooldown marks even a recent reading", tab_badge() == "👤 Live ~0%", tab_badge())
-S._remember_usage("claude:live", [
+S._remember_usage(cache_key("Live"), [
     {"label": "session", "percent": 42}, {"label": "weekly", "percent": 100}])
 check("exhausted weekly usage does not replace the session", tab_badge() == "👤 Live 42%", tab_badge())
 for label in ("session", "five_hour", "5h"):
-    S._remember_usage("claude:live", [
+    S._remember_usage(cache_key("Live"), [
         {"label": "weekly_all", "percent": 67},
         {"label": "weekly Fable", "percent": 100},
         {"label": label, "percent": 0},
     ])
     check("session usage wins over exhausted Fable: " + label,
           tab_badge() == "👤 Live 0%", tab_badge())
-S._remember_usage("claude:live", [
+S._remember_usage(cache_key("Live"), [
     {"label": "session", "percent": 100},
     {"label": "weekly", "percent": 67},
 ])
 check("an exhausted session is shown",
       tab_badge() == "👤 Live 100%", tab_badge())
-S._remember_usage("claude:live", [
+S._remember_usage(cache_key("Live"), [
     {"label": "session", "percent": None},
     {"label": "weekly Fable", "percent": 100},
 ])
 check("unavailable session usage keeps only the name", tab_badge() == "👤 Live", tab_badge())
 fake.store = claude_payload("TARGET", "target-access", "target-refresh", expired=False)
+S._select_profile("claude", profile_id("Target"))
 check("an account change picks its own usage", tab_badge() == "👤 Target 99%", tab_badge())
 fake.store = claude_payload("UNSAVED", "other-access", "other-refresh", expired=False)
 check("an unsaved login gets no saved percentage", "%" not in tab_badge(), tab_badge())
@@ -455,7 +472,7 @@ check("repeated ticks fetch only the live account once", asked == ["LIVE"], str(
 check("the next badge reads the refreshed figure", tab_badge() == "👤 Live 23%", tab_badge())
 cache = S._usage_cache()
 for field in ("at", "badge_attempt_at"):
-    cache["claude:live"][field] = time.time() - S.USAGE_TTL_S - 1
+    cache[cache_key("Live")][field] = time.time() - S.USAGE_TTL_S - 1
 S._write_json_secret(S.USAGE_CACHE, cache)
 S.cmd_badge_refresh(["claude"])
 check("expiry triggers another read", asked == ["LIVE", "LIVE"], str(asked))
@@ -475,7 +492,7 @@ for failure in (http_error(429), urllib.error.URLError("offline"), None):
           asked == ["LIVE"], str(asked))
     if getattr(failure, "code", None) == 429:
         check("badge throttling is shared with other usage readers",
-              S._usage_cache()["claude:live"]["retry_after"] > time.time())
+              S._usage_cache()[cache_key("Live")]["retry_after"] > time.time())
 check("background refresh never writes credentials", fake.writes == 0)
 S._write_json_secret(S.USAGE_CACHE, saved_cache)
 S.fetch_usage = REAL_FETCH_USAGE
@@ -503,12 +520,12 @@ fake = reset()
 S.renew_profile = lambda k, p, force=False: p.get("payload")
 asked = []
 S.fetch_usage = lambda k, payload: asked.append(1) or []
-S._remember_usage("claude:target", [
+S._remember_usage(cache_key("Target"), [
     {"label": "session", "percent": 100, "resets_at": time.time() + 3600},
     {"label": "weekly", "percent": 40, "resets_at": time.time() + 90000},
 ])
 rows = list_json()
-target = next((r for r in rows if r.get("slug") == "target"), None)
+target = next((r for r in rows if r.get("id") == profile_id("Target")), None)
 check("the parked profile is listed", target is not None, str(rows))
 check("its windows come through",
       [w.get("label") for w in (target or {}).get("windows") or []]
@@ -630,10 +647,10 @@ def verified_usage(*args):
     return [{"label": "session", "percent": 100}]
 S.fetch_usage = verified_usage
 S.proven_payload("claude", S.get_profile("claude", "target"))
-cached = S._usage_cache()["claude:target"]
+cached = S._usage_cache()[cache_key("Target")]
 check("the switch check records the actual full session",
       cached["windows"][0]["percent"] == 100, str(cached))
-S._remember_usage("claude:live", [{"label": "session", "percent": 25}])
+S._remember_usage(cache_key("Live"), [{"label": "session", "percent": 25}])
 asked.clear()
 S.usage_rows(["claude"])
 check("opening the picker reuses that read instead of asking again",
@@ -657,7 +674,7 @@ check("an HTTP date is accepted", S._usage_retry_delay(error) > 901)
 error.headers = {"Retry-After": "901"}
 S.fetch_usage = raises(error)
 S.proven_payload("claude", S.get_profile("claude", "target"))
-retry = S._usage_cache()["claude:target"]["retry_after"]
+retry = S._usage_cache()[cache_key("Target")]["retry_after"]
 check("a throttled switch check shares its cooldown with the picker",
       899 < retry - time.time() <= 901, str(retry))
 
@@ -670,11 +687,11 @@ def limited_usage(*args):
     raise http_error(429)
 S.fetch_usage = limited_usage
 old_at = time.time() - 7200
-S._write_json_secret(S.USAGE_CACHE, {"claude:target": {
+S._write_json_secret(S.USAGE_CACHE, {cache_key("Target"): {
     "at": old_at,
     "windows": [{"label": "session", "percent": 0, "read_at": old_at}],
 }})
-row = next(r for r in S.usage_rows(["claude"]) if r["slug"] == "target")
+row = next(r for r in S.usage_rows(["claude"]) if r["id"] == profile_id("Target"))
 check("a 429 keeps the last reading explicitly marked as stale",
       "~0%" in S.usage_summary(row)[0] and "rate limited" not in S.usage_summary(row)[0],
       str(S.usage_summary(row)))
@@ -683,7 +700,7 @@ check("expanded usage gives the reason and age alongside the old numbers",
       "rate limited" in detail[0][0] and "ago" in detail[0][0]
       and "0%" in detail[1][0], str(detail))
 asked.clear()
-row = next(r for r in S.usage_rows(["claude"]) if r["slug"] == "target")
+row = next(r for r in S.usage_rows(["claude"]) if r["id"] == profile_id("Target"))
 check("backoff preserves the failure without another request",
       not asked and row["problem"] == "rate limited", str(row))
 row = {"state": "live", "at": old_at, "windows": row["windows"]}
@@ -1122,6 +1139,9 @@ check("the refusal is still reported, and nothing is raised", code == 1,
       str(code))
 S.DISPATCH.clear()
 S.DISPATCH.update(real_dispatch)
+
+records = subprocess.run([sys.executable, "-B", str(Path(__file__).with_name("test_account_records.py"))])
+check("UUID account record regressions", records.returncode == 0)
 
 shutil.rmtree(STATE, ignore_errors=True)
 print("\n%s — %d of the checks failed"
