@@ -20,9 +20,9 @@ import time
 import urllib.error
 from pathlib import Path
 
-STATE = tempfile.mkdtemp(prefix="account-switch-test-")
-os.environ["HERDR_PLUGIN_STATE_DIR"] = STATE
-os.environ["HERDR_PLUGIN_CONFIG_DIR"] = STATE
+STATE = tempfile.mkdtemp(prefix="account-hub-test-")
+os.environ["ACCOUNT_HUB_STATE_DIR"] = STATE
+os.environ["ACCOUNT_HUB_CONFIG_DIR"] = STATE
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import switcher as S  # noqa: E402
 

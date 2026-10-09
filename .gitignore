@@ -4,6 +4,7 @@ __pycache__/
 .DS_Store
 
 # Local credentials and account state must never be committed.
+/.local/
 .env
 .env.*
 !.env.example

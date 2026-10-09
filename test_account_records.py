@@ -8,6 +8,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import tempfile
 import tomllib
 import unittest
@@ -29,8 +30,8 @@ def login(user="one", credential="first", session="session-one"):
 class AccountRecords(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="account-hub-records-")
-        with patch.dict(os.environ, {"HERDR_PLUGIN_STATE_DIR": self.temp.name,
-                                     "HERDR_PLUGIN_CONFIG_DIR": self.temp.name}):
+        with patch.dict(os.environ, {"ACCOUNT_HUB_STATE_DIR": self.temp.name,
+                                     "ACCOUNT_HUB_CONFIG_DIR": self.temp.name}):
             spec = importlib.util.spec_from_file_location(
                 "isolated_switcher", Path(__file__).with_name("switcher.py"))
             self.S = importlib.util.module_from_spec(spec)
@@ -266,13 +267,18 @@ class PluginNamespace(unittest.TestCase):
     def load_plugin(self, home, overrides=None):
         env = dict(os.environ)
         for key in ("HERDR_PLUGIN_ID", "HERDR_PLUGIN_STATE_DIR",
-                    "HERDR_PLUGIN_CONFIG_DIR"):
+                    "HERDR_PLUGIN_CONFIG_DIR", "ACCOUNT_HUB_STATE_DIR",
+                    "ACCOUNT_HUB_CONFIG_DIR"):
             env.pop(key, None)
         env.update({"HOME": str(home), "CODEX_HOME": str(home / ".codex")})
         env.update(overrides or {})
+        root = home / "plugin-checkout"
+        root.mkdir(exist_ok=True)
+        script = root / "switcher.py"
+        shutil.copyfile(Path(__file__).with_name("switcher.py"), script)
         with patch.dict(os.environ, env, clear=True):
             spec = importlib.util.spec_from_file_location(
-                "namespaced_switcher", Path(__file__).with_name("switcher.py"))
+                "namespaced_switcher", script)
             plugin = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(plugin)
         return plugin
@@ -285,6 +291,7 @@ class PluginNamespace(unittest.TestCase):
             original.write_text(json.dumps({"label": "Original", "payload": login()}))
             before = original.read_bytes()
             plugin = self.load_plugin(home)
+            self.assertEqual(Path(plugin.STATE_DIR), home / "plugin-checkout/.local")
             self.assertEqual(plugin.list_profiles("codex"), [])
             manifest = tomllib.loads(Path(__file__).with_name("herdr-plugin.toml").read_text())
             self.assertNotEqual(manifest["id"], "rcosteira.account-switch")
@@ -295,13 +302,27 @@ class PluginNamespace(unittest.TestCase):
             self.assertEqual([p["label"] for p in plugin.list_profiles("codex")], ["Hub"])
             self.assertEqual(original.read_bytes(), before)
 
-    def test_herdr_overrides_keep_a_separate_profile_store(self):
+    def test_herdr_and_original_plugin_settings_do_not_redirect_the_hub(self):
+        with tempfile.TemporaryDirectory(prefix="account-hub-herdr-env-") as temp:
+            home = Path(temp)
+            original = home / "original-state/profiles/codex/original.json"
+            original.parent.mkdir(parents=True)
+            original.write_text(json.dumps({"label": "Original", "payload": login()}))
+            plugin = self.load_plugin(home, {
+                "HERDR_PLUGIN_STATE_DIR": str(home / "original-state"),
+                "HERDR_PLUGIN_CONFIG_DIR": str(home / "original-config"),
+                "ACCOUNT_SWITCH_NOTIFY": "0", "ACCOUNT_HUB_NOTIFY": "1"})
+            self.assertEqual(plugin.list_profiles("codex"), [])
+            self.assertEqual(Path(plugin.CONFIG_DIR), home / "plugin-checkout/.local/config")
+            self.assertTrue(plugin.NOTIFY)
+
+    def test_plugin_specific_overrides_keep_a_separate_profile_store(self):
         with tempfile.TemporaryDirectory(prefix="account-hub-overrides-") as temp:
             home = Path(temp)
             state = home / "custom-state"
             config = home / "custom-config"
             plugin = self.load_plugin(home, {"HERDR_PLUGIN_ID": "fixture.plugin",
-                "HERDR_PLUGIN_STATE_DIR": str(state), "HERDR_PLUGIN_CONFIG_DIR": str(config)})
+                "ACCOUNT_HUB_STATE_DIR": str(state), "ACCOUNT_HUB_CONFIG_DIR": str(config)})
             own = state / "profiles/codex/fixture.json"
             own.parent.mkdir(parents=True)
             own.write_text(json.dumps({"label": "Fixture", "payload": login()}))

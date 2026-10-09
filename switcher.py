@@ -12,7 +12,7 @@ What a profile holds (per agent kind):
           identity block out of ~/.claude.json
   codex   ~/.codex/auth.json
 
-Profiles live in HERDR_PLUGIN_STATE_DIR/profiles/<kind>/<uuid>.json, 0600 under
+Profiles live in this checkout's .local/profiles/<kind>/<uuid>.json, 0600 under
 a 0700 directory. They are password-equivalent secrets: same value as the files
 they came from, in the same place on the same machine, and never leave it.
 
@@ -47,26 +47,19 @@ import uuid
 
 PLUGIN_ID = os.environ.get("HERDR_PLUGIN_ID", "c0r0nell.account-hub")
 HERDR = os.environ.get("HERDR_BIN_PATH", "herdr")
-# The fallback has to match the directory herdr itself uses, because the badge
-# command runs from `tab_bar_right`, which passes no plugin state dir.
-STATE_DIR = os.environ.get("HERDR_PLUGIN_STATE_DIR") or os.path.expanduser(
-    os.path.join("~/.local/state/herdr/plugins", PLUGIN_ID)
-)
+# Resolve the script rather than the caller's cwd or an inherited plugin path.
+# This also works when the script is reached through STATE_DIR/current.
+ROOT = os.path.dirname(os.path.realpath(__file__))
+# Each checkout owns its private data. Herdr's injected state/config directories
+# and Account Switch's environment settings must not redirect Account Hub.
+STATE_DIR = os.path.expanduser(os.environ.get("ACCOUNT_HUB_STATE_DIR")
+                              or os.path.join(ROOT, ".local"))
 PROFILES_DIR = os.path.join(STATE_DIR, "profiles")
 BACKUP_DIR = os.path.join(STATE_DIR, "backups")
 LOCK = os.path.join(STATE_DIR, "switch.lock")
 SELECTION = os.path.join(STATE_DIR, "selection.json")
-# Where a plugin lives depends on how it was installed: `plugin install` puts it
-# under a `<plugin-id>-<hash>` directory, `plugin link` leaves it where you
-# linked it. The hash is sha256(plugin_id) cut to twelve characters, so an
-# install path is stable across updates — but it is herdr's layout, not a
-# documented interface. This symlink lives in the state directory, which is
-# keyed by plugin id and is already ours, and is repointed on every run. Config
-# can name it whichever way the plugin was installed.
-# realpath, not abspath: this script is *meant* to be run through the symlink
-# below, and abspath would then report the symlink's own directory — so the
-# refresh would point the link at itself and nothing could be read through it.
-ROOT = os.path.dirname(os.path.realpath(__file__))
+# The checkout-local state directory has a stable link for status commands.
+# ROOT uses realpath so following this link cannot repoint it at itself.
 STABLE_LINK = os.path.join(STATE_DIR, "current")
 
 TOKEN = "acct"
@@ -75,8 +68,9 @@ KEEP_BACKUPS = 10
 IS_MAC = platform.system() == "Darwin"
 
 
-CONFIG_DIR = os.environ.get("HERDR_PLUGIN_CONFIG_DIR") or STATE_DIR
-PREFIX = "ACCOUNT_SWITCH_"
+CONFIG_DIR = os.path.expanduser(os.environ.get("ACCOUNT_HUB_CONFIG_DIR")
+                               or os.path.join(STATE_DIR, "config"))
+PREFIX = "ACCOUNT_HUB_"
 
 
 def _load_settings():
@@ -109,7 +103,7 @@ def _setting(name):
     """The environment first, then the config file, then nothing.
 
     The config key is the variable without its prefix, lowercased:
-    ACCOUNT_SWITCH_USAGE_RENEW is `usage_renew`.
+    ACCOUNT_HUB_USAGE_RENEW is `usage_renew`.
     """
     if name in os.environ:
         return os.environ[name]
@@ -133,21 +127,21 @@ def _num_env(name, default):
         return default
 
 
-NOTIFY = _flag("ACCOUNT_SWITCH_NOTIFY")
-BADGE = _flag("ACCOUNT_SWITCH_BADGE")
+NOTIFY = _flag("ACCOUNT_HUB_NOTIFY")
+BADGE = _flag("ACCOUNT_HUB_BADGE")
 # Badge a kind with no saved profile too.
-BADGE_ALWAYS = _flag("ACCOUNT_SWITCH_BADGE_ALWAYS", default=False)
-GLYPH = _setting("ACCOUNT_SWITCH_GLYPH") or "\N{BUST IN SILHOUETTE}"  # 👤
+BADGE_ALWAYS = _flag("ACCOUNT_HUB_BADGE_ALWAYS", default=False)
+GLYPH = _setting("ACCOUNT_HUB_GLYPH") or "\N{BUST IN SILHOUETTE}"  # 👤
 # Both fields are optional: "{glyph}" is a badge with no text, "{name}" is text
 # with no glyph.
-BADGE_FORMAT = _setting("ACCOUNT_SWITCH_BADGE_FORMAT") or "{glyph} {name}"
-SEPARATOR = _setting("ACCOUNT_SWITCH_SEPARATOR") or " · "
+BADGE_FORMAT = _setting("ACCOUNT_HUB_BADGE_FORMAT") or "{glyph} {name}"
+SEPARATOR = _setting("ACCOUNT_HUB_SEPARATOR") or " · "
 # How long any one command we shell out to may take before it is abandoned.
 # Generous: it is a backstop against never finishing, not a performance budget.
-COMMAND_TIMEOUT_S = _num_env("ACCOUNT_SWITCH_COMMAND_TIMEOUT_S", 30.0)
+COMMAND_TIMEOUT_S = _num_env("ACCOUNT_HUB_COMMAND_TIMEOUT_S", 30.0)
 # How long to wait for another switch's lock before refusing. A real switch
 # holds it for well under a second, so this never trips in normal use.
-LOCK_TIMEOUT_S = _num_env("ACCOUNT_SWITCH_LOCK_TIMEOUT_S", 5.0)
+LOCK_TIMEOUT_S = _num_env("ACCOUNT_HUB_LOCK_TIMEOUT_S", 5.0)
 
 
 class SwitchError(Exception):
@@ -905,18 +899,18 @@ CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 CLAUDE_USAGE_BETA = "oauth-2025-04-20"
 CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 USAGE_CACHE = os.path.join(STATE_DIR, "usage-cache.json")
-USAGE_TTL_S = _num_env("ACCOUNT_SWITCH_USAGE_TTL_S", 120.0)
-USAGE_TIMEOUT_S = _num_env("ACCOUNT_SWITCH_USAGE_TIMEOUT_S", 8.0)
+USAGE_TTL_S = _num_env("ACCOUNT_HUB_USAGE_TTL_S", 120.0)
+USAGE_TIMEOUT_S = _num_env("ACCOUNT_HUB_USAGE_TIMEOUT_S", 8.0)
 # How long to leave an account alone after it answers 429.
-USAGE_BACKOFF_S = _num_env("ACCOUNT_SWITCH_USAGE_BACKOFF_S", 300.0)
-BAR_WIDTH = int(_num_env("ACCOUNT_SWITCH_USAGE_BAR_WIDTH", 10))
-_BAR_CHARS = _setting("ACCOUNT_SWITCH_USAGE_BAR") or "█░"
+USAGE_BACKOFF_S = _num_env("ACCOUNT_HUB_USAGE_BACKOFF_S", 300.0)
+BAR_WIDTH = int(_num_env("ACCOUNT_HUB_USAGE_BAR_WIDTH", 10))
+_BAR_CHARS = _setting("ACCOUNT_HUB_USAGE_BAR") or "█░"
 BAR_FULL = _BAR_CHARS[0]
 BAR_EMPTY = _BAR_CHARS[1] if len(_BAR_CHARS) > 1 else " "
 
 
 def _thresholds():
-    raw = _setting("ACCOUNT_SWITCH_USAGE_THRESHOLDS") or "60,85"
+    raw = _setting("ACCOUNT_HUB_USAGE_THRESHOLDS") or "60,85"
     try:
         warn, crit = (float(x) for x in raw.split(",", 1))
         return warn, crit
@@ -936,7 +930,7 @@ COLOR_NAMES = {
 
 def _color_map():
     out = {"ok": "green", "warn": "yellow", "crit": "red", "stale": "blue"}
-    raw = _setting("ACCOUNT_SWITCH_USAGE_COLORS") or ""
+    raw = _setting("ACCOUNT_HUB_USAGE_COLORS") or ""
     for part in raw.split(","):
         if "=" in part:
             key, value = part.split("=", 1)
@@ -1103,10 +1097,10 @@ CODEX_RENEW_URL = "https://auth.openai.com/oauth/token"
 CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 # Renew this far ahead of expiry rather than after it, so a token cannot die
 # mid-read. openusage uses the same five minutes.
-RENEW_MARGIN_S = _num_env("ACCOUNT_SWITCH_RENEW_MARGIN_S", 300.0)
-USAGE_RENEW = _flag("ACCOUNT_SWITCH_USAGE_RENEW", default=True)
+RENEW_MARGIN_S = _num_env("ACCOUNT_HUB_RENEW_MARGIN_S", 300.0)
+USAGE_RENEW = _flag("ACCOUNT_HUB_USAGE_RENEW", default=True)
 # Ask the provider whether a saved login still works before installing it.
-VERIFY_SWITCH = _flag("ACCOUNT_SWITCH_VERIFY_SWITCH", default=True)
+VERIFY_SWITCH = _flag("ACCOUNT_HUB_VERIFY_SWITCH", default=True)
 
 
 # The token endpoint answers the CLI's own HTTP client, and refuses a default
@@ -2252,7 +2246,7 @@ def summary_window(row):
 FIVE_HOURS = 5 * 3600
 SEVEN_DAYS = 7 * 86400
 # Spend this much of a window and its rate means something, however new it is.
-SETTLED_PERCENT = _num_env("ACCOUNT_SWITCH_SETTLED_PERCENT", 5.0)
+SETTLED_PERCENT = _num_env("ACCOUNT_HUB_SETTLED_PERCENT", 5.0)
 
 def _centred(text, width):
     """A column title sitting over the middle of its column."""

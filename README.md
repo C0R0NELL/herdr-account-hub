@@ -7,6 +7,10 @@ Its plugin ID is `c0r0nell.account-hub`; the original remains
 separate profile, selection, cache and backup directories. They still operate
 on the same machine-wide Claude Code and Codex credential stores.
 
+Account Hub keeps its private files in `.local/` inside its own checkout.
+It uses `ACCOUNT_HUB_` settings and does not use the original plugin's settings
+or Herdr's shared plugin state/config directories.
+
 Hot-swap Claude Code / Codex logins from inside [herdr](https://herdr.dev),
 without logging out and back in. For the case: your main account hits its
 window at 11am, you have a second one, and you don't want to re-auth in a
@@ -116,7 +120,7 @@ in the tab bar instead and turn the pane token off:
 ```toml
 [ui]
 tab_bar_right = [
-  { type = "command", command = "python3 ~/.local/state/herdr/plugins/c0r0nell.account-hub/current/switcher.py badge claude", interval_seconds = 30, timeout_seconds = 5 },
+  { type = "command", command = "python3 ~/.local/share/herdr/plugins/account-hub/.local/current/switcher.py badge claude", interval_seconds = 30, timeout_seconds = 5 },
   { type = "text", text = "  " },
 ]
 tab_bar_right_separator = ""
@@ -128,19 +132,10 @@ keeps it. Blank `tab_bar_right_separator` when you add one, or the default ` · 
 lands between the badge and the inset. Drop both lines if you want the badge
 hard against the edge.
 
-That path is a symlink the plugin repoints at itself on every run. Naming the
-install directory instead would also work — herdr names it
-`<plugin-id>-<hash>`, and the hash is `sha256(plugin_id)` truncated to twelve
-characters, so it is stable across updates and moves only if the plugin id
-changes. Checked on every plugin installed here, this one included.
-
-The symlink is still the better path to write down. Where a plugin lives depends
-on how it was installed — `herdr plugin install` puts it under
-`~/.config/herdr/plugins/github/`, `herdr plugin link` leaves it wherever you
-linked it — and that layout is herdr's business, not a documented interface. The
-symlink is keyed by plugin id in the state directory, which herdr already treats
-as ours. `herdr plugin list --plugin c0r0nell.account-hub --json` reports the
-real directory if you want it.
+That path uses `.local/current`, a symlink inside this checkout that points
+back to the plugin's code. If you link the checkout at a different location,
+adjust the command to that location. `herdr plugin list --plugin
+c0r0nell.account-hub --json` reports the linked directory.
 
 The `badge` command prints one line and exits — herdr re-runs it on the
 interval, so this needs no daemon and no `[[startup]]` hook. It reads the
@@ -159,7 +154,7 @@ the account name when a cached session reading exists;
 `~42%` marks an old reading or a reporting cooldown. While herdr polls the badge,
 it refreshes the active account's usage every two minutes by default, respecting
 provider cooldowns. Set `usage_ttl_s = 300` for five minutes, or use
-`ACCOUNT_SWITCH_USAGE_TTL_S=300` in the command. New readings appear on the next
+`ACCOUNT_HUB_USAGE_TTL_S=300` in the command. New readings appear on the next
 tab-bar poll (30 seconds in the example above). Background requests keep slow
 responses from delaying the badge; failed reads retain the last percentage.
 Without a reading, the badge shows only the account name until a refresh succeeds.
@@ -170,7 +165,7 @@ badge. A credential store is machine-wide per agent, so every claude pane bills
 to the same account; a per-pane badge would print the same value on each one.
 Printing both accounts once, on the tab bar, says everything there is to say.
 
-Set `ACCOUNT_SWITCH_BADGE=0` in herdr's environment to stop stamping panes once
+Set `ACCOUNT_HUB_BADGE=0` in herdr's environment to stop stamping panes once
 the tab bar shows it, or keep both — they read the same value.
 
 #### In ccstatusline instead
@@ -182,7 +177,7 @@ the output — the same one-line `badge` command, no herdr involved:
 ```json
 {
   "type": "custom-command",
-  "commandPath": "python3 ~/.local/state/herdr/plugins/c0r0nell.account-hub/current/switcher.py badge claude",
+  "commandPath": "python3 ~/.local/share/herdr/plugins/account-hub/.local/current/switcher.py badge claude",
   "timeout": 2000
 }
 ```
@@ -203,7 +198,7 @@ stated exactly once.
 
 #### Choosing the badge
 
-`ACCOUNT_SWITCH_GLYPH` picks the character, and `ACCOUNT_SWITCH_BADGE_FORMAT`
+`ACCOUNT_HUB_GLYPH` picks the character, and `ACCOUNT_HUB_BADGE_FORMAT`
 decides what goes around it. Both fields are optional, so the format doubles as
 a way to show less:
 
@@ -236,7 +231,7 @@ For a `tab_bar_right` entry, set them inline on the command — that env is your
 to write, unlike the one herdr hands to plugin actions:
 
 ```toml
-command = "ACCOUNT_SWITCH_GLYPH=🔑 python3 ~/.local/state/herdr/plugins/c0r0nell.account-hub/current/switcher.py badge claude"
+command = "ACCOUNT_HUB_GLYPH=🔑 python3 ~/.local/share/herdr/plugins/account-hub/.local/current/switcher.py badge claude"
 ```
 
 **2. Keybindings** — `herdr server reload-config` after editing these:
@@ -263,7 +258,7 @@ reports where the plugin is installed:
 [[keys.command]]
 key = "prefix+1"
 type = "shell"
-command = "python3 ~/.local/state/herdr/plugins/c0r0nell.account-hub/current/switcher.py switch claude work"
+command = "python3 ~/.local/share/herdr/plugins/account-hub/.local/current/switcher.py switch claude work"
 ```
 
 ## Usage
@@ -324,7 +319,7 @@ sidecar the instant it lands, rewrite the profile, clear the sidecar. A run that
 dies mid-way is adopted by the next one. An access token lasts hours, so this is
 roughly one renewal per account per token lifetime, not one per refresh.
 
-`ACCOUNT_SWITCH_USAGE_RENEW=0` turns it off; parked accounts then show their
+`ACCOUNT_HUB_USAGE_RENEW=0` turns it off; parked accounts then show their
 last-seen numbers with an age, and the live ones stay accurate.
 
 A last-seen reading still projects. Each window records when it was read, and
@@ -337,10 +332,10 @@ The age beside the account is what says how much to trust it.
 
 | var | default | meaning |
 |-----|---------|---------|
-| `ACCOUNT_SWITCH_USAGE_THRESHOLDS` | `60,85` | percent at which a window turns warn, then crit |
-| `ACCOUNT_SWITCH_USAGE_COLORS` | `ok=green,warn=yellow,crit=red,stale=blue` | the palette |
-| `ACCOUNT_SWITCH_USAGE_BAR` | `█░` | filled and empty bar characters |
-| `ACCOUNT_SWITCH_USAGE_BAR_WIDTH` | `10` | bar width in cells |
+| `ACCOUNT_HUB_USAGE_THRESHOLDS` | `60,85` | percent at which a window turns warn, then crit |
+| `ACCOUNT_HUB_USAGE_COLORS` | `ok=green,warn=yellow,crit=red,stale=blue` | the palette |
+| `ACCOUNT_HUB_USAGE_BAR` | `█░` | filled and empty bar characters |
+| `ACCOUNT_HUB_USAGE_BAR_WIDTH` | `10` | bar width in cells |
 
 The overlay and the `--color` text form read the same palette, so they agree.
 
@@ -468,7 +463,7 @@ explicitly replace that record's authentication.
 **only** the `oauthAccount` key of `~/.claude.json` is touched — projects,
 history and onboarding state are rewritten verbatim.
 
-New profiles live in `HERDR_PLUGIN_STATE_DIR/profiles/<kind>/<uuid>.json`, mode
+New profiles live in `<checkout>/.local/profiles/<kind>/<uuid>.json`, mode
 `0600` inside a `0700` directory. They contain email/provider metadata and
 password-equivalent credentials. `selection.json` stores the selected UUID per
 kind; usage caches and rotating-token sidecars are keyed by UUID too.
@@ -482,14 +477,14 @@ the registration and reauthentication workflow.
 
 ### Repository privacy
 
-With no state-directory override, private data lives outside this checkout at
-`~/.local/state/herdr/plugins/c0r0nell.account-hub/`. Its `profiles/`,
-`backups/` and `rotated/` directories all contain credentials. The live Codex
+Private data lives in this checkout's `.local/` directory. Its `profiles/`,
+`backups/` and `rotated/` directories all contain credentials. Its `config/`
+directory contains only Account Hub's settings. The live Codex
 login remains in `~/.codex/auth.json` (or `$CODEX_HOME/auth.json`). These files
 are not source code and must not be published.
 
-The repository's `.gitignore` also excludes local credential files, `.env`
-files, and account-state directories copied into the checkout. Ignore rules do
+The repository's `.gitignore` excludes all of `/.local/`, plus local credential
+files, `.env` files and account-state directories copied into the checkout. Ignore rules do
 not remove files already committed or protect secrets pasted into tracked code.
 Tests use temporary directories and fictitious logins only.
 
@@ -515,7 +510,7 @@ you something, so every switch:
    so a profile saved hours ago holds older ones; parking the account without
    updating it can leave a copy that is no longer able to renew, and that costs
    a browser login to repair;
-4. writes a timestamped backup of it under `HERDR_PLUGIN_STATE_DIR/backups/`
+4. writes a timestamped backup of it under `<checkout>/.local/backups/`
    (last 10 kept);
 5. reads the store back and compares the account identity, and **puts the
    previous login back** if the write didn't take.
@@ -526,10 +521,10 @@ rather than take the `autosaved-…` name.
 
 ## Config
 
-Settings live in a file in the plugin's own config directory:
+Settings live inside the plugin's own checkout:
 
 ```sh
-$(herdr plugin config-dir c0r0nell.account-hub)/config.toml
+~/.local/share/herdr/plugins/account-hub/.local/config/config.toml
 ```
 
 ```toml
@@ -559,9 +554,14 @@ usage_renew = false
 verify_switch = false
 ```
 
-The key is the variable below without its `ACCOUNT_SWITCH_` prefix, lowercased.
+The key is the variable below without its `ACCOUNT_HUB_` prefix, lowercased.
 `config.json` works too if you prefer it. A file that fails to parse is ignored
 rather than fatal, and the defaults stand.
+
+`ACCOUNT_HUB_STATE_DIR` and `ACCOUNT_HUB_CONFIG_DIR` can explicitly override
+these paths. Herdr's injected `HERDR_PLUGIN_STATE_DIR` and
+`HERDR_PLUGIN_CONFIG_DIR` are ignored; they cannot redirect the Hub into another
+plugin's storage.
 
 An environment variable still wins over the file, but is rarely the practical
 choice: plugin actions inherit the **herdr server's** environment, so setting
@@ -571,19 +571,19 @@ command, which is why they are the easy place to restyle the badge.
 
 | var | default | meaning |
 |-----|---------|---------|
-| `ACCOUNT_SWITCH_NOTIFY` | `1` | herdr notification on each switch, and on a refused one |
-| `ACCOUNT_SWITCH_BADGE` | `1` | write the `$acct` pane token |
-| `ACCOUNT_SWITCH_BADGE_ALWAYS` | `0` | badge a kind with no saved profile too |
-| `ACCOUNT_SWITCH_GLYPH` | `👤` | the badge character |
-| `ACCOUNT_SWITCH_BADGE_FORMAT` | `{glyph} {name}` | badge layout, from `{glyph}`, `{name}`, `{agent}`, `{title}`; any may be dropped |
-| `ACCOUNT_SWITCH_SEPARATOR` | ` · ` | between kinds, when `badge` prints more than one |
-| `ACCOUNT_SWITCH_VERIFY_SWITCH` | `1` | ask the provider whether a saved login still works before installing it |
-| `ACCOUNT_SWITCH_USAGE_RENEW` | `1` | renew a parked account's token so its usage can be read |
-| `ACCOUNT_SWITCH_USAGE_TTL_S` | `120` | how long a usage answer is reused |
-| `ACCOUNT_SWITCH_SETTLED_PERCENT` | `5` | spend this much of a window and its rate counts, however new it is |
-| `ACCOUNT_SWITCH_RENEW_MARGIN_S` | `300` | renew this far ahead of a token's expiry |
-| `ACCOUNT_SWITCH_COMMAND_TIMEOUT_S` | `30` | how long any one command may take before it is abandoned |
-| `ACCOUNT_SWITCH_LOCK_TIMEOUT_S` | `5` | how long to wait for another switch before refusing |
+| `ACCOUNT_HUB_NOTIFY` | `1` | herdr notification on each switch, and on a refused one |
+| `ACCOUNT_HUB_BADGE` | `1` | write the `$acct` pane token |
+| `ACCOUNT_HUB_BADGE_ALWAYS` | `0` | badge a kind with no saved profile too |
+| `ACCOUNT_HUB_GLYPH` | `👤` | the badge character |
+| `ACCOUNT_HUB_BADGE_FORMAT` | `{glyph} {name}` | badge layout, from `{glyph}`, `{name}`, `{agent}`, `{title}`; any may be dropped |
+| `ACCOUNT_HUB_SEPARATOR` | ` · ` | between kinds, when `badge` prints more than one |
+| `ACCOUNT_HUB_VERIFY_SWITCH` | `1` | ask the provider whether a saved login still works before installing it |
+| `ACCOUNT_HUB_USAGE_RENEW` | `1` | renew a parked account's token so its usage can be read |
+| `ACCOUNT_HUB_USAGE_TTL_S` | `120` | how long a usage answer is reused |
+| `ACCOUNT_HUB_SETTLED_PERCENT` | `5` | spend this much of a window and its rate counts, however new it is |
+| `ACCOUNT_HUB_RENEW_MARGIN_S` | `300` | renew this far ahead of a token's expiry |
+| `ACCOUNT_HUB_COMMAND_TIMEOUT_S` | `30` | how long any one command may take before it is abandoned |
+| `ACCOUNT_HUB_LOCK_TIMEOUT_S` | `5` | how long to wait for another switch before refusing |
 | `HERDR_BIN_PATH` | `herdr` | herdr binary (set by herdr when it invokes an action) |
 
 
@@ -637,7 +637,7 @@ it to stderr, and herdr drops that. The failure then read as "the badge did not
 change", with nothing saying why.
 
 `next`, `switch`, `save` and `reauth` send the reason as a herdr notification. A
-completed switch already sent one, so the two match. `ACCOUNT_SWITCH_NOTIFY=0`
+completed switch already sent one, so the two match. `ACCOUNT_HUB_NOTIFY=0`
 turns both off. Nothing polled sends one: `badge` runs once a second from the
 tab bar, and a notification per tick would be worse than the silence.
 
