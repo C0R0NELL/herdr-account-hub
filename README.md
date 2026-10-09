@@ -1,4 +1,11 @@
-# account-switch
+# Account Hub
+
+Account Hub is an independent fork of
+[herdr-account-switch](https://github.com/rcosteira79/herdr-account-switch).
+Its plugin ID is `c0r0nell.account-hub`; the original remains
+`rcosteira.account-switch`. Both can be registered at the same time, with
+separate profile, selection, cache and backup directories. They still operate
+on the same machine-wide Claude Code and Codex credential stores.
 
 Hot-swap Claude Code / Codex logins from inside [herdr](https://herdr.dev),
 without logging out and back in. For the case: your main account hits its
@@ -39,16 +46,19 @@ restate a value that changes twice a day.
 ## Install
 
 ```sh
-herdr plugin install rcosteira79/herdr-account-switch
+gh repo clone C0R0NELL/account-hub ~/.local/share/herdr/plugins/account-hub
+herdr plugin link ~/.local/share/herdr/plugins/account-hub
 ```
 
-Or link a local checkout: `herdr plugin link /path/to/herdr-account-switch`.
-Re-run `install`/`link` after a `herdr update` — updates drop plugins.
+This repository is private, so cloning requires GitHub access. A development
+checkout can also be linked with `herdr plugin link /path/to/account-hub`.
+Pull code updates into the linked checkout and close/reopen an existing picker.
+Re-run `herdr plugin link` when the manifest changes.
 
 Then, with the account you use most logged in:
 
 ```sh
-herdr plugin action invoke save --plugin rcosteira.account-switch
+herdr plugin action invoke save --plugin c0r0nell.account-hub
 ```
 
 That snapshots whatever is logged in right now. Log into the other account the
@@ -68,7 +78,7 @@ some row names `$acct`, the badge is invisible and herdr reports no error. The
 `enable-badge` action does that one edit for you:
 
 ```sh
-herdr plugin action invoke enable-badge --plugin rcosteira.account-switch
+herdr plugin action invoke enable-badge --plugin c0r0nell.account-hub
 ```
 
 It backs `config.toml` up first, merges `$acct` into the rows you already have
@@ -106,7 +116,7 @@ in the tab bar instead and turn the pane token off:
 ```toml
 [ui]
 tab_bar_right = [
-  { type = "command", command = "python3 ~/.local/state/herdr/plugins/rcosteira.account-switch/current/switcher.py badge claude", interval_seconds = 30, timeout_seconds = 5 },
+  { type = "command", command = "python3 ~/.local/state/herdr/plugins/c0r0nell.account-hub/current/switcher.py badge claude", interval_seconds = 30, timeout_seconds = 5 },
   { type = "text", text = "  " },
 ]
 tab_bar_right_separator = ""
@@ -129,7 +139,7 @@ on how it was installed — `herdr plugin install` puts it under
 `~/.config/herdr/plugins/github/`, `herdr plugin link` leaves it wherever you
 linked it — and that layout is herdr's business, not a documented interface. The
 symlink is keyed by plugin id in the state directory, which herdr already treats
-as ours. `herdr plugin list --plugin rcosteira.account-switch --json` reports the
+as ours. `herdr plugin list --plugin c0r0nell.account-hub --json` reports the
 real directory if you want it.
 
 The `badge` command prints one line and exits — herdr re-runs it on the
@@ -172,7 +182,7 @@ the output — the same one-line `badge` command, no herdr involved:
 ```json
 {
   "type": "custom-command",
-  "commandPath": "python3 ~/.local/state/herdr/plugins/rcosteira.account-switch/current/switcher.py badge claude",
+  "commandPath": "python3 ~/.local/state/herdr/plugins/c0r0nell.account-hub/current/switcher.py badge claude",
   "timeout": 2000
 }
 ```
@@ -226,7 +236,7 @@ For a `tab_bar_right` entry, set them inline on the command — that env is your
 to write, unlike the one herdr hands to plugin actions:
 
 ```toml
-command = "ACCOUNT_SWITCH_GLYPH=🔑 python3 ~/.local/state/herdr/plugins/rcosteira.account-switch/current/switcher.py badge claude"
+command = "ACCOUNT_SWITCH_GLYPH=🔑 python3 ~/.local/state/herdr/plugins/c0r0nell.account-hub/current/switcher.py badge claude"
 ```
 
 **2. Keybindings** — `herdr server reload-config` after editing these:
@@ -235,25 +245,25 @@ command = "ACCOUNT_SWITCH_GLYPH=🔑 python3 ~/.local/state/herdr/plugins/rcoste
 [[keys.command]]
 key = "prefix+a"              # cycle the focused agent's kind to its next account
 type = "plugin_action"
-command = "rcosteira.account-switch.next"
+command = "c0r0nell.account-hub.next"
 description = "next account"
 
 [[keys.command]]
 key = "prefix+shift+a"        # open the picker
 type = "plugin_action"
-command = "rcosteira.account-switch.open"
+command = "c0r0nell.account-hub.open"
 description = "account picker"
 ```
 
 To jump straight to one named account, call the script instead — actions take
-no arguments. `herdr plugin list --plugin rcosteira.account-switch --json`
+no arguments. `herdr plugin list --plugin c0r0nell.account-hub --json`
 reports where the plugin is installed:
 
 ```toml
 [[keys.command]]
 key = "prefix+1"
 type = "shell"
-command = "python3 ~/.local/state/herdr/plugins/rcosteira.account-switch/current/switcher.py switch claude work"
+command = "python3 ~/.local/state/herdr/plugins/c0r0nell.account-hub/current/switcher.py switch claude work"
 ```
 
 ## Usage
@@ -261,7 +271,7 @@ command = "python3 ~/.local/state/herdr/plugins/rcosteira.account-switch/current
 What is left on every account you have saved, both agent kinds, in one panel:
 
 ```sh
-herdr plugin action invoke usage --plugin rcosteira.account-switch
+herdr plugin action invoke usage --plugin c0r0nell.account-hub
 ```
 
 ```
@@ -473,7 +483,7 @@ the registration and reauthentication workflow.
 ### Repository privacy
 
 With no state-directory override, private data lives outside this checkout at
-`~/.local/state/herdr/plugins/rcosteira.account-switch/`. Its `profiles/`,
+`~/.local/state/herdr/plugins/c0r0nell.account-hub/`. Its `profiles/`,
 `backups/` and `rotated/` directories all contain credentials. The live Codex
 login remains in `~/.codex/auth.json` (or `$CODEX_HOME/auth.json`). These files
 are not source code and must not be published.
@@ -519,7 +529,7 @@ rather than take the `autosaved-…` name.
 Settings live in a file in the plugin's own config directory:
 
 ```sh
-$(herdr plugin config-dir rcosteira.account-switch)/config.toml
+$(herdr plugin config-dir c0r0nell.account-hub)/config.toml
 ```
 
 ```toml
@@ -640,7 +650,7 @@ needs no permission from macOS.
 
 Credential layouts are the agents' private business and can change without
 notice. If a switch stops taking, `herdr plugin action invoke status --plugin
-rcosteira.account-switch` prints what each store currently reports; the store
+c0r0nell.account-hub` prints what each store currently reports; the store
 paths and the shape read out of them are the two constants at the top of
 `ClaudeBackend` / `CodexBackend` in `switcher.py`.
 

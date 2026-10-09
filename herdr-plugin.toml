@@ -1,4 +1,4 @@
-id = "rcosteira.account-switch"
+id = "c0r0nell.account-hub"
 name = "Account Hub"
 version = "0.1.0"
 min_herdr_version = "0.8.0"
@@ -14,7 +14,7 @@ command = ["python3", "switcher.py", "stamp"]
 # config up first and reloads the server. Startup only warns; this one writes.
 [[actions]]
 id = "enable-badge"
-title = "Accounts: add the $acct badge to the sidebar"
+title = "Account Hub: add the $acct badge to the sidebar"
 contexts = ["global"]
 command = ["python3", "switcher.py", "enable-badge"]
 
@@ -22,7 +22,7 @@ command = ["python3", "switcher.py", "enable-badge"]
 # you would rather show the account once in the tab bar than on every row.
 [[actions]]
 id = "disable-badge"
-title = "Accounts: remove the $acct badge from the sidebar"
+title = "Account Hub: remove the $acct badge from the sidebar"
 contexts = ["global"]
 command = ["python3", "switcher.py", "disable-badge"]
 
@@ -30,7 +30,7 @@ command = ["python3", "switcher.py", "disable-badge"]
 # about any one pane, the credentials it swaps are machine-wide per agent kind.
 [[actions]]
 id = "open"
-title = "Accounts: open picker"
+title = "Account Hub: open picker"
 contexts = ["global"]
 command = ["python3", "switcher.py", "open"]
 
@@ -38,38 +38,38 @@ command = ["python3", "switcher.py", "open"]
 # no UI. `pane` context so it can read the focused agent to pick the kind.
 [[actions]]
 id = "next"
-title = "Accounts: switch to next account"
+title = "Account Hub: switch to next account"
 contexts = ["global", "pane"]
 command = ["python3", "switcher.py", "next"]
 
 # Snapshot whatever is logged in right now into a new profile.
 [[actions]]
 id = "save"
-title = "Accounts: save current login as a profile"
+title = "Account Hub: save current login as a profile"
 contexts = ["global"]
 command = ["python3", "switcher.py", "save"]
 
 [[actions]]
 id = "status"
-title = "Accounts: status"
+title = "Account Hub: status"
 contexts = ["global"]
 command = ["python3", "switcher.py", "status"]
 
 # What is left on every saved account, both agent kinds, in one panel.
 [[actions]]
 id = "usage"
-title = "Accounts: open usage"
+title = "Account Hub: open usage"
 contexts = ["global"]
 command = ["python3", "switcher.py", "open-usage"]
 
 [[panes]]
 id = "picker"
-title = "Accounts"
+title = "Account Hub"
 command = ["python3", "switcher.py", "ui"]
 placement = "overlay"
 
 [[panes]]
 id = "usage"
-title = "Usage"
+title = "Account Hub Usage"
 command = ["python3", "switcher.py", "usage-ui"]
 placement = "overlay"

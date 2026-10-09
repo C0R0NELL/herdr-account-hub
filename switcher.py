@@ -45,7 +45,7 @@ from email.utils import parsedate_to_datetime
 import time
 import uuid
 
-PLUGIN_ID = os.environ.get("HERDR_PLUGIN_ID", "rcosteira.account-switch")
+PLUGIN_ID = os.environ.get("HERDR_PLUGIN_ID", "c0r0nell.account-hub")
 HERDR = os.environ.get("HERDR_BIN_PATH", "herdr")
 # The fallback has to match the directory herdr itself uses, because the badge
 # command runs from `tab_bar_right`, which passes no plugin state dir.
@@ -1750,7 +1750,7 @@ def cmd_open(argv):
         "--placement", "overlay",
     )
     if res.returncode != 0:
-        sys.stderr.write(res.stderr or "account-switch: failed to open picker\n")
+        sys.stderr.write(res.stderr or "account-hub: failed to open picker\n")
     return res.returncode
 
 
@@ -1762,7 +1762,7 @@ def cmd_open_usage(argv):
         "--placement", "overlay",
     )
     if res.returncode != 0:
-        sys.stderr.write(res.stderr or "account-switch: failed to open usage\n")
+        sys.stderr.write(res.stderr or "account-hub: failed to open usage\n")
     return res.returncode
 
 
@@ -2975,7 +2975,7 @@ def warn_if_unwired():
             if _token_wired(handle.read()):
                 return
         herdr(
-            "notification", "show", "Accounts: badge not visible",
+            "notification", "show", "Account Hub: badge not visible",
             "--body",
             "No sidebar row names $%s. Run the enable-badge action to add it."
             % TOKEN,
@@ -3076,10 +3076,10 @@ def main():
     try:
         return DISPATCH[sys.argv[1]](sys.argv[2:]) or 0
     except SwitchError as exc:
-        print(f"account-switch: {exc}", file=sys.stderr)
+        print(f"account-hub: {exc}", file=sys.stderr)
         doing = NOTIFY_FAILURE.get(sys.argv[1])
         if doing:
-            notify(f"Accounts: {doing} failed", str(exc))
+            notify(f"Account Hub: {doing} failed", str(exc))
         return 1
 
 

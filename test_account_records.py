@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import tomllib
 import unittest
 import uuid
 from unittest.mock import patch
@@ -259,6 +260,55 @@ class AccountRecords(unittest.TestCase):
         uuid.UUID(first["id"])
         self.assertEqual(path.read_bytes(), before)
         self.assertEqual(list(directory.iterdir()), [path])
+
+
+class PluginNamespace(unittest.TestCase):
+    def load_plugin(self, home, overrides=None):
+        env = dict(os.environ)
+        for key in ("HERDR_PLUGIN_ID", "HERDR_PLUGIN_STATE_DIR",
+                    "HERDR_PLUGIN_CONFIG_DIR"):
+            env.pop(key, None)
+        env.update({"HOME": str(home), "CODEX_HOME": str(home / ".codex")})
+        env.update(overrides or {})
+        with patch.dict(os.environ, env, clear=True):
+            spec = importlib.util.spec_from_file_location(
+                "namespaced_switcher", Path(__file__).with_name("switcher.py"))
+            plugin = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(plugin)
+        return plugin
+
+    def test_fork_profiles_are_separate_from_the_original_plugin(self):
+        with tempfile.TemporaryDirectory(prefix="account-hub-namespace-") as temp:
+            home = Path(temp)
+            original = home / ".local/state/herdr/plugins/rcosteira.account-switch/profiles/codex/original.json"
+            original.parent.mkdir(parents=True)
+            original.write_text(json.dumps({"label": "Original", "payload": login()}))
+            before = original.read_bytes()
+            plugin = self.load_plugin(home)
+            self.assertEqual(plugin.list_profiles("codex"), [])
+            manifest = tomllib.loads(Path(__file__).with_name("herdr-plugin.toml").read_text())
+            self.assertNotEqual(manifest["id"], "rcosteira.account-switch")
+            self.assertEqual(plugin.PLUGIN_ID, manifest["id"])
+            own = Path(plugin.PROFILES_DIR, "codex", "hub.json")
+            own.parent.mkdir(parents=True)
+            own.write_text(json.dumps({"label": "Hub", "payload": login()}))
+            self.assertEqual([p["label"] for p in plugin.list_profiles("codex")], ["Hub"])
+            self.assertEqual(original.read_bytes(), before)
+
+    def test_herdr_overrides_keep_a_separate_profile_store(self):
+        with tempfile.TemporaryDirectory(prefix="account-hub-overrides-") as temp:
+            home = Path(temp)
+            state = home / "custom-state"
+            config = home / "custom-config"
+            plugin = self.load_plugin(home, {"HERDR_PLUGIN_ID": "fixture.plugin",
+                "HERDR_PLUGIN_STATE_DIR": str(state), "HERDR_PLUGIN_CONFIG_DIR": str(config)})
+            own = state / "profiles/codex/fixture.json"
+            own.parent.mkdir(parents=True)
+            own.write_text(json.dumps({"label": "Fixture", "payload": login()}))
+            self.assertEqual(plugin.PLUGIN_ID, "fixture.plugin")
+            self.assertEqual(plugin.CONFIG_DIR, str(config))
+            self.assertEqual([p["label"] for p in plugin.list_profiles("codex")], ["Fixture"])
+            self.assertFalse((home / ".local/state/herdr/plugins").exists())
 
 
 if __name__ == "__main__":
