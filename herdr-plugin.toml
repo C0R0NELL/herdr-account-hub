@@ -1,5 +1,5 @@
 id = "rcosteira.account-switch"
-name = "Account Switch"
+name = "Account Hub"
 version = "0.1.0"
 min_herdr_version = "0.8.0"
 description = "Hot-swap Claude Code / Codex logins without re-authenticating. Overlay picker, cycle-to-next keybinding, and a per-pane account badge ($acct)."
