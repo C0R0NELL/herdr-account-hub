@@ -5,13 +5,14 @@ import copy
 import io
 import os
 from pathlib import Path
+import re
 import tempfile
 import types
 import unittest
 import urllib.error
 from unittest.mock import patch
 
-from test_account_records import login
+from tests.test_account_records import login
 
 
 class UsagePicker(unittest.TestCase):
@@ -25,7 +26,7 @@ class UsagePicker(unittest.TestCase):
         })
         self.env.start()
         spec = importlib.util.spec_from_file_location(
-            "usage_picker_hub", Path(__file__).with_name("switcher.py"))
+            "usage_picker_hub", Path(__file__).resolve().parents[1] / "switcher.py")
         self.S = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(self.S)
         S = self.S
@@ -56,24 +57,30 @@ class UsagePicker(unittest.TestCase):
         self.env.stop()
         self.temp.cleanup()
 
-    def picker(self, actions, height=12, read_usage=True, width=140):
+    def picker(self, actions, height=12, read_usage=True, width=140, mouse_available=True):
         frames = []
         keys = iter(actions)
+        mouse_events = []
+        self.mouse_masks = []
         test = self
 
         class Screen:
-            def __init__(self, size=None):
+            def __init__(self, size=None, origin=(0, 0)):
                 self.size = size or (height, width)
+                self.origin = origin
                 self.erase()
             def getmaxyx(self): return self.size
+            def getbegyx(self): return self.origin
             def timeout(self, *args): pass
             def keypad(self, *args): pass
             def box(self): pass
             def touchwin(self): pass
+            def clearok(self, *args): pass
             def erase(self): self.lines, self.selected, self.paints = {}, [], []
             def refresh(self):
                 frames.append({"lines": dict(self.lines), "selected": list(self.selected),
-                               "paints": list(self.paints), "modal": self.size != (height, width)})
+                               "paints": list(self.paints), "modal": self.size != (height, width),
+                               "origin": self.origin})
             def addnstr(self, y, x, text, count, attr=0):
                 test.assertTrue(0 <= y < self.size[0] and 0 <= x < self.size[1])
                 text = text[:count]
@@ -85,22 +92,260 @@ class UsagePicker(unittest.TestCase):
             def getch(self):
                 action = next(keys)
                 if callable(action):
-                    return action()
+                    action = action()
+                if isinstance(action, tuple) and len(action) == 4:
+                    _, text, offset, state = action
+                    y, line = next((y, line) for y, line in self.lines.items() if text in line)
+                    mouse_events.append((0, self.origin[1] + line.index(text) + offset,
+                                         self.origin[0] + y, 0, state))
+                    return 409
+                if isinstance(action, tuple):
+                    name, x, state = action
+                    frame = next(f for f in reversed(frames) if not f["modal"])
+                    y = next(y for y, text in frame["lines"].items() if name in text)
+                    mouse_events.append((0, x, y, 0, state))
+                    return 409
                 return action
+
+        def mousemask(mask):
+            self.mouse_masks.append(mask)
+            return (mask if mouse_available else 0, 0)
 
         curses = types.SimpleNamespace(
             curs_set=lambda *args: None, has_colors=lambda: False,
             wrapper=lambda run: run(Screen()), KEY_DOWN=258, KEY_UP=259,
-            newwin=lambda h, w, y, x: Screen((h, w)),
-            KEY_ENTER=343, A_BOLD=1, A_DIM=2, A_UNDERLINE=4,
-            A_REVERSE=8, A_NORMAL=0)
-        with patch.dict("sys.modules", {"curses": curses}):
+            newwin=lambda h, w, y, x: Screen((h, w), (y, x)),
+            KEY_ENTER=343, KEY_BACKSPACE=263, A_BOLD=1, A_DIM=2, A_UNDERLINE=4,
+            A_REVERSE=8, A_NORMAL=0, KEY_MOUSE=409, BUTTON1_CLICKED=4,
+            BUTTON_SHIFT=1 << 26, BUTTON_CTRL=1 << 25, BUTTON_ALT=1 << 27,
+            error=RuntimeError, mousemask=mousemask,
+            getmouse=lambda: mouse_events.pop(0))
+        def link(y, x):
+            frames[-1].setdefault("links", []).append((y, x, self.S.DONATE_URL))
+
+        with patch.dict("sys.modules", {"curses": curses}), \
+                patch.object(self.S, "_sync_picker_size", return_value=False), \
+                patch.object(self.S, "_emit_donate_link", side_effect=link):
             if read_usage:
                 self.S.cmd_ui([])
             else:
                 with patch.object(self.S, "usage_rows", return_value=[]):
                     self.S.cmd_ui([])
         return frames
+
+    def test_mouse_name_selects_clicked_uuid_and_opens_switch_confirmation(self):
+        with patch.object(self.S, "switch", return_value="Switched") as switch:
+            frames = self.picker([("Bravo", 3, 4), 10, 27], height=14)
+        switch.assert_called_once_with("codex", self.profiles[1]["id"])
+        modal = next(index for index, f in enumerate(frames) if f["modal"])
+        self.assertTrue(any("Bravo" in text for text in frames[modal - 1]["selected"]))
+        self.assertTrue(any("Switch to Bravo ?" in text for text in frames[modal]["lines"].values()))
+        self.assertEqual(self.mouse_masks, [4, 0])
+
+    def test_mouse_switch_cancellation_preserves_clicked_selection(self):
+        with patch.object(self.S, "switch") as switch:
+            frames = self.picker([("Echo", 4, 4), 27, 27], height=14)
+        switch.assert_not_called()
+        self.assertTrue(any("Echo" in text for text in frames[-1]["selected"]))
+
+    def test_mouse_reset_uses_clicked_account_and_nearest_expiry_after_confirmation(self):
+        posts, _ = self.reset_provider()
+        frames = self.picker([("Bravo", 45, 4), 10, 27], height=14)
+        modal = " ".join(text for f in frames if f["modal"] for text in f["lines"].values())
+        self.assertIn("Use a reset for Bravo ?", modal)
+        self.assertIn("Expires: 2099-10-22 19:09 UTC", modal)
+        self.assertEqual(len(posts), 1)
+        self.assertEqual(posts[0][0], "Bravo")
+        self.assertEqual(posts[0][1]["credit_id"], "first-Bravo")
+        self.assertTrue(posts[0][1]["redeem_request_id"])
+        self.assertTrue(any("Bravo" in text for text in frames[-1]["selected"]))
+
+    def test_mouse_reset_cancellation_does_not_consume_a_credit(self):
+        posts, _ = self.reset_provider()
+        self.picker([("Bravo", 45, 4), 27, 27], height=14)
+        self.assertEqual(posts, [])
+
+    def test_mouse_hits_follow_scrolling_and_expanded_account_rows(self):
+        with patch.object(self.S, "switch") as switch:
+            self.picker([258] * 4 + [("Charlie", 3, 4), 10, 27], height=9)
+            switch.assert_called_once_with("codex", self.profiles[2]["id"])
+        with patch.object(self.S, "switch") as switch:
+            self.picker([ord("d"), ("Bravo", 3, 4), 10, 27], height=30)
+            switch.assert_called_once_with("codex", self.profiles[1]["id"])
+        posts, _ = self.reset_provider()
+        self.picker([ord("d"), ("Bravo", 45, 4), 10, 27], height=30)
+        self.assertEqual(posts[0][0], "Bravo")
+
+    def test_mouse_switches_from_usage_identity_markers_and_blank_account_cells(self):
+        for column in (0, 1, 2, 18, 25, 43, 57, 85, 138):
+            with self.subTest(column=column), patch.object(self.S, "switch") as switch:
+                self.picker([("Bravo", column, 4), 10, 27], height=14)
+                switch.assert_called_once_with("codex", self.profiles[1]["id"])
+
+    def test_mouse_reset_column_padding_keeps_its_reset_action(self):
+        posts, _ = self.reset_provider()
+        with patch.object(self.S, "switch") as switch:
+            self.picker([("Bravo", self.S.RESETS_COL + self.S.RESETS_W - 1, 4), 10, 27], height=14)
+        switch.assert_not_called()
+        self.assertEqual(len(posts), 1)
+        self.assertEqual(posts[0][0], "Bravo")
+
+    def test_mouse_ignores_headers_release_and_modified_clicks(self):
+        with patch.object(self.S, "switch") as switch, \
+                patch.object(self.S, "prepare_reset") as reset:
+            self.picker([("Codex", 3, 4),
+                         ("Bravo", 3, 1), ("Bravo", 3, 4 | (1 << 25)),
+                         ("Bravo", 45, 4 | (1 << 27)), 27], height=14)
+        switch.assert_not_called()
+        reset.assert_not_called()
+
+    def test_clicking_modal_enter_confirms_switch_and_escape_cancels(self):
+        for button, confirm in (("enter", True), ("esc", False)):
+            with self.subTest(button=button), patch.object(self.S, "switch") as switch:
+                self.picker([("Bravo", 3, 4), ("modal", button, 0, 4), 27], height=14)
+                if confirm:
+                    switch.assert_called_once_with("codex", self.profiles[1]["id"])
+                else:
+                    switch.assert_not_called()
+
+    def test_unrelated_or_modified_modal_clicks_wait_for_explicit_confirmation(self):
+        with patch.object(self.S, "switch") as switch:
+            self.picker([("Bravo", 3, 4), ("modal", "Switch to", 1, 4),
+                         ("modal", " | ", 1, 4), ("modal", "enter", 0, 4 | (1 << 25)),
+                         ("modal", "enter", 0, 1), ("modal", "enter", 0, 4), 27], height=14)
+        switch.assert_called_once_with("codex", self.profiles[1]["id"])
+
+    def test_mouse_can_select_provider_and_submit_name_and_login_confirmation(self):
+        with patch.object(self.S, "_ui_login", return_value="Saved") as sign_in:
+            self.picker([ord('u'), ("modal", "Claude (beta)", 1, 4),
+                         ("modal", "enter", 0, 4), ord('W'), ord('o'), ord('r'), ord('k'),
+                         ("modal", "enter", 0, 4), ("modal", "enter", 0, 4), 27], height=18)
+        self.assertEqual(sign_in.call_args.args[1], 'claude')
+        self.assertEqual(sign_in.call_args.kwargs['label'], 'Work')
+
+    def test_mouse_escape_cancels_provider_or_name_without_starting_login(self):
+        for actions in ([ord('u'), ("modal", "esc", 0, 4), 27],
+                        [ord('u'), 10, ("modal", "esc", 0, 4), 27]):
+            with self.subTest(actions=actions), patch.object(self.S, "_ui_login") as sign_in:
+                self.picker(actions, height=18)
+                sign_in.assert_not_called()
+
+    def test_clicking_modal_enter_or_escape_applies_the_existing_reset_confirmation(self):
+        posts, _ = self.reset_provider()
+        self.picker([("Bravo", 45, 4), ("modal", "esc", 0, 4), 27], height=14)
+        self.assertEqual(posts, [])
+        self.picker([("Bravo", 45, 4), ("modal", "enter", 0, 4), 27], height=14)
+        self.assertEqual(len(posts), 1)
+        self.assertEqual(posts[0][0], "Bravo")
+
+    def test_keyboard_remains_available_when_terminal_has_no_mouse_support(self):
+        with patch.object(self.S, "switch") as switch:
+            self.picker([258, 10, 10, 27], height=14, mouse_available=False)
+        switch.assert_called_once_with("codex", self.profiles[1]["id"])
+
+    def test_mouse_claude_switch_also_requires_confirmation(self):
+        profile = self.S.make_profile("claude", "Claude fixture", {
+            "credentials": {"claudeAiOauth": {"accessToken": "claude-fixture"}},
+            "oauthAccount": {"emailAddress": "claude@example.invalid"},
+        })
+        self.S.write_profile(profile)
+        with patch.object(self.S, "switch") as switch:
+            frames = self.picker([("Claude fixture", 3, 4), 27, 27],
+                                 height=18, read_usage=False)
+        switch.assert_not_called()
+        self.assertTrue(any("Switch to Claude fixture ?" in text
+                            for f in frames if f["modal"] for text in f["lines"].values()))
+        with patch.object(self.S, "switch") as switch:
+            self.picker([("Claude fixture", 3, 4), 10, 27], height=18, read_usage=False)
+        switch.assert_called_once_with("claude", profile["id"])
+
+    def test_mouse_does_not_switch_an_account_deleted_before_confirmation(self):
+        native_rows = self.S._rows
+        calls = []
+
+        def rows():
+            calls.append(True)
+            if len(calls) == 2:
+                self.S.delete_profile("codex", self.profiles[1]["id"])
+            return native_rows()
+
+        with patch.object(self.S, "_rows", side_effect=rows), \
+                patch.object(self.S, "switch") as switch:
+            frames = self.picker([("Bravo", 3, 4), 27], height=14)
+        switch.assert_not_called()
+        self.assertFalse(any(f["modal"] for f in frames))
+
+    def test_mouse_zero_resets_shows_notice_without_confirmation_or_consumption(self):
+        posts, banks = self.reset_provider()
+        banks["Bravo"] = []
+        frames = self.picker([("Bravo", 45, 4), 27], height=14)
+        self.assertEqual(posts, [])
+        self.assertFalse(any(f["modal"] for f in frames))
+        self.assertIn("No resets available for this account.", frames[-1]["lines"][13])
+
+    def test_support_footer_stays_right_aligned_without_reading_a_version(self):
+        with patch.object(self.S, "_plugin_version", side_effect=AssertionError(
+                "the picker footer must not read a version")):
+            frames = self.picker([ord("d"), -1, ord("r"), ord("q")], width=100)
+            for frame in frames:
+                self.assertTrue(frame["lines"][11].endswith("Coffe <3 "))
+                self.assertEqual(frame["links"], [(11, 91,
+                    "https://github.com/sponsors/C0R0NELL?frequency=one-time&sponsor=C0R0NELL")])
+            reopened = self.picker([ord("q")], width=100)
+            self.assertTrue(reopened[-1]["lines"][11].endswith("Coffe <3 "))
+
+    def test_support_footer_preserves_status_without_overlap(self):
+        with patch.object(self.S, "_confirm", return_value=True), \
+                patch.object(self.S, "switch", side_effect=self.S.SwitchError(
+                    "Account change failed: " + "a long explanation " * 10)):
+            frames = self.picker([10, ord("q")], width=60)
+        footer = frames[-1]["lines"][11]
+        self.assertTrue(footer.startswith("Account change failed: "))
+        self.assertEqual(footer[49:], "  Coffe <3 ")
+
+    def test_support_footer_fits_narrow_panes(self):
+        narrow = self.picker([ord("q")], width=10)
+        tiny = self.picker([ord("q")], width=5)
+        self.assertEqual(narrow[-1]["lines"][11], " Coffe <3 ")
+        self.assertEqual(narrow[-1]["links"], [(11, 1, self.S.DONATE_URL)])
+        self.assertNotIn("links", tiny[-1])
+
+    def test_version_reader_rejects_missing_malformed_or_unsafe_values(self):
+        root = Path(self.temp.name, "manifest-fixture")
+        root.mkdir()
+        manifest = root / "herdr-plugin.toml"
+        with patch.object(self.S, "ROOT", str(root)):
+            self.assertIsNone(self.S._plugin_version())
+            for text in ('version = [', 'name = "No version"', 'version = 212',
+                         'version = "Donate\\nmalicious"'):
+                with self.subTest(manifest=text):
+                    manifest.write_text(text)
+                    self.assertIsNone(self.S._plugin_version())
+            manifest.write_text('version = "2.1.2-rc.1+build.3"')
+            self.assertEqual(self.S._plugin_version(), "2.1.2-rc.1+build.3")
+
+    def test_terminal_link_wraps_support_text_and_restores_the_cursor(self):
+        output = io.StringIO()
+        with patch.object(self.S.sys, "stdout", output), \
+                patch.object(output, "isatty", return_value=True), \
+                patch.object(output, "fileno", return_value=1), \
+                patch.object(self.S.os, "get_terminal_size", return_value=os.terminal_size((100, 12))), \
+                patch.dict(os.environ, {"TERM": "xterm-256color"}):
+            self.S._emit_donate_link(11, 91)
+        wire = output.getvalue()
+        links = re.findall(r"\x1b\]8;;([^\x1b]+)\x1b\\(.*?)\x1b\]8;;\x1b\\", wire, re.S)
+        self.assertEqual(len(links), 1)
+        url, label = links[0]
+        self.assertEqual(url, "https://github.com/sponsors/C0R0NELL?frequency=one-time&sponsor=C0R0NELL")
+        self.assertEqual(re.sub(r"\x1b\[[0-9;]*m", "", label), "Coffe <3")
+        self.assertIn("\x1b[12;92H", wire)
+        self.assertTrue(wire.startswith("\x1b7") and wire.endswith("\x1b8"))
+
+    def test_redirected_output_has_no_terminal_hyperlink_sequences(self):
+        output = io.StringIO()
+        with patch.object(self.S.sys, "stdout", output):
+            self.S._emit_donate_link(11, 87)
+        self.assertEqual(output.getvalue(), "")
 
     def test_scroll_reaches_fifth_account_in_small_picker(self):
         frames = self.picker([258] * 4 + [ord("q")], height=9)
@@ -321,6 +566,144 @@ class UsagePicker(unittest.TestCase):
         self.assertEqual(first[1], "!")
         self.assertNotEqual(last[1], "!")
 
+    def test_opening_recovers_a_temporary_read_failure_without_manual_refresh(self):
+        self.S.usage_rows(["codex"])
+        native = self.S._http_json
+        clock = [self.S.time.time()]
+        attempts = []
+
+        def temporary_failure(url, headers):
+            name = headers["Authorization"].removeprefix("Bearer ")
+            attempts.append(name)
+            if name == "Bravo" and attempts.count(name) == 1:
+                raise urllib.error.URLError("temporary connection failure")
+            return native(url, headers)
+
+        def idle():
+            clock[0] += 5
+            return -1
+
+        self.S._http_json = temporary_failure
+        with patch.object(self.S.time, "time", side_effect=lambda: clock[0]):
+            frames = self.picker([idle, 27], height=14)
+        first = next(text for text in frames[0]["lines"].values() if "Bravo" in text)
+        last = next(text for text in frames[-1]["lines"].values() if "Bravo" in text)
+        self.assertEqual(first[1], "!")
+        self.assertNotEqual(last[1], "!")
+        self.assertEqual(attempts.count("Bravo"), 2)
+        self.assertEqual(attempts.count("Alpha"), 1)
+
+    def test_temporary_read_retries_are_bounded_and_keep_persistent_warning(self):
+        self.S.usage_rows(["codex"])
+        native = self.S._http_json
+        clock = [self.S.time.time()]
+        attempts = []
+
+        def unavailable(url, headers):
+            name = headers["Authorization"].removeprefix("Bearer ")
+            attempts.append(name)
+            if name == "Bravo":
+                raise urllib.error.HTTPError("https://example.invalid", 503,
+                                             "unavailable", {}, io.BytesIO(b"{}"))
+            return native(url, headers)
+
+        def idle():
+            clock[0] += 5
+            return -1
+
+        self.S._http_json = unavailable
+        with patch.object(self.S.time, "time", side_effect=lambda: clock[0]):
+            frames = self.picker([idle] * 12 + [27], height=14)
+        last = next(text for text in frames[-1]["lines"].values() if "Bravo" in text)
+        self.assertEqual(last[1], "!")
+        self.assertEqual(attempts.count("Bravo"), 4)
+        self.assertEqual(attempts.count("Alpha"), 1)
+
+    def test_auth_failures_and_rate_limits_do_not_get_temporary_read_retries(self):
+        for code in (401, 403, 429):
+            with self.subTest(code=code):
+                self.S.usage_rows(["codex"], force=True)
+                attempts = []
+                clock = [self.S.time.time()]
+
+                def refused(url, headers):
+                    attempts.append(headers["Authorization"])
+                    raise urllib.error.HTTPError("https://example.invalid", code,
+                                                 "refused", {}, io.BytesIO(b"{}"))
+
+                def idle():
+                    clock[0] += 5
+                    return -1
+
+                native = self.S._http_json
+                self.S._http_json = refused
+                with patch.object(self.S, "USAGE_RENEW", False), \
+                        patch.object(self.S.time, "time", side_effect=lambda: clock[0]):
+                    frames = self.picker([idle] * 12 + [27], height=14)
+                self.assertEqual(len(attempts), 5)
+                last = next(text for text in frames[-1]["lines"].values() if "Bravo" in text)
+                self.assertEqual(last[1], "!")
+                self.S._http_json = native
+
+    def test_failed_renewal_is_not_retried_as_a_temporary_usage_read(self):
+        self.S.usage_rows(["codex"])
+        clock = [self.S.time.time()]
+
+        def idle():
+            clock[0] += 5
+            return -1
+
+        with patch.object(self.S, "renew_profile", side_effect=urllib.error.URLError(
+                "uncertain renewal response")) as renew, \
+                patch.object(self.S.time, "time", side_effect=lambda: clock[0]):
+            self.picker([idle] * 12 + [27], height=14)
+        self.assertEqual(renew.call_count, 5)
+
+    def test_exhausted_read_retries_respect_normal_ttl_across_other_readers(self):
+        self.S.usage_rows(["codex"])
+        clock = [self.S.time.time()]
+        with patch.object(self.S, "_http_json", side_effect=TimeoutError) as request, \
+                patch.object(self.S.time, "time", side_effect=lambda: clock[0]):
+            self.S.usage_rows(["codex"], force=True)
+            for delay in (5, 10, 20):
+                clock[0] += delay
+                self.S.usage_rows(["codex"])
+            self.assertEqual(request.call_count, 20)
+            for _ in range(10):
+                clock[0] += 5
+                self.S.usage_rows(["codex"])
+            self.assertEqual(request.call_count, 20)
+
+    def test_rate_limit_after_temporary_failure_stops_automatic_retries(self):
+        self.S.usage_rows(["codex"])
+        clock = [self.S.time.time()]
+        with patch.object(self.S, "_http_json", side_effect=TimeoutError):
+            self.S.usage_rows(["codex"], force=True)
+        clock[0] += 5
+        error = urllib.error.HTTPError("https://example.invalid", 429, "throttled",
+                                       {"Retry-After": "300"}, io.BytesIO(b"{}"))
+        with patch.object(self.S, "_http_json", side_effect=error) as request, \
+                patch.object(self.S.time, "time", side_effect=lambda: clock[0]):
+            self.S.usage_rows(["codex"])
+            for _ in range(10):
+                clock[0] += 5
+                self.S.usage_rows(["codex"])
+            self.assertEqual(request.call_count, 5)
+
+    def test_cold_start_failures_do_not_retry_before_their_deadline(self):
+        clock = [self.S.time.time()]
+        with patch.object(self.S, "_http_json", side_effect=TimeoutError) as request, \
+                patch.object(self.S.time, "time", side_effect=lambda: clock[0]):
+            rows = self.S.usage_rows(["codex"])
+            self.assertEqual(request.call_count, 5)
+            self.assertEqual(rows[0]["refresh_after"], clock[0] + 5)
+            clock[0] += 4
+            self.S.usage_rows(["codex"])
+            self.assertEqual(request.call_count, 5)
+            clock[0] += 1
+            self.S.usage_rows(["codex"])
+            self.assertEqual(request.call_count, 10)
+
     def test_successful_read_of_saved_credentials_clears_previous_login_refusal(self):
         profile = self.profiles[0]
         key = "codex:" + profile["id"]
@@ -403,7 +786,9 @@ class UsagePicker(unittest.TestCase):
         fresh = login("Alpha", "new-login", "new-grant")
         self.S.BACKENDS["codex"].write_live(fresh)
         self.S._select_profile("codex", profile["id"])
-        self.assertIsNone(self.S.active_profile("codex"), "a new grant is not a token rotation")
+        self.assertEqual(self.S.active_profile("codex")["id"], profile["id"])
+        self.assertIsNone(self.S._selected_login_profile("codex"),
+                          "displaying the live email does not authorize token synchronization")
         before = Path(self.S.PROFILES_DIR, "codex", profile["slug"] + ".json").read_bytes()
         head = next(body for row_type, kind, body in self.S._rows() if row_type == "head")
         self.assertNotIn("unsaved", head)
@@ -415,6 +800,42 @@ class UsagePicker(unittest.TestCase):
         head = next(body for row_type, kind, body in self.S._rows() if row_type == "head")
         self.assertNotIn("press", head)
         self.assertEqual(self.S._selection(), {})
+
+    def test_live_email_has_one_current_marker_even_with_a_stale_selection(self):
+        profile = self.profiles[1]
+        self.S.BACKENDS["codex"].write_live(login("Bravo", "fresh", "new-grant"))
+        self.S._select_profile("codex", self.profiles[0]["id"])
+        frames = self.picker([27], height=14, read_usage=False)
+        rows = list(frames[-1]["lines"].values())
+        current = [line for line in rows if len(line) > 1 and line[1] == "●"]
+        self.assertEqual(len(current), 1)
+        self.assertIn("Bravo", current[0])
+        self.assertEqual(self.S._selection()["codex"], self.profiles[0]["id"])
+        self.assertEqual(self.S.get_profile("codex", profile["id"])["payload"], profile["payload"])
+
+    def test_current_marker_remains_visible_alongside_a_reporting_error(self):
+        native = self.S._http_json
+        self.S.BACKENDS["codex"].write_live(self.profiles[1]["payload"])
+
+        def refused(url, headers):
+            if headers["Authorization"] == "Bearer Bravo":
+                raise urllib.error.HTTPError("https://example.invalid", 403,
+                                             "refused", {}, io.BytesIO(b"{}"))
+            return native(url, headers)
+
+        self.S._http_json = refused
+        frames = self.picker([27], height=14)
+        current = next(line for line in frames[-1]["lines"].values() if "Bravo" in line)
+        self.assertEqual(current[:2], "●!")
+
+    def test_same_email_in_claude_and_codex_can_be_saved_independently(self):
+        payload = {"credentials": {"claudeAiOauth": {"accessToken": "fake"}},
+                   "oauth_account": {"accountUuid": "claude-user", "emailAddress": "Alpha@example.invalid"}}
+        self.S.BACKENDS["claude"].read_live = lambda: payload
+        self.S.save_live("claude", "Claude Alpha")
+        self.assertEqual(len(self.S.list_profiles("codex")), 5)
+        self.assertEqual(len(self.S.list_profiles("claude")), 1)
+        self.assertEqual(self.S.active_profile("claude")["label"], "Claude Alpha")
 
     def test_s_skips_already_saved_account_without_prompting_or_selecting(self):
         self.S.BACKENDS["codex"].write_live(self.profiles[0]["payload"])
@@ -476,7 +897,9 @@ class UsagePicker(unittest.TestCase):
         self.assertEqual(account["windows"][0]["percent"], 87)
         self.assertEqual(self.S.get_profile("codex", profile["id"])["payload"], profile["payload"])
         self.assertNotIn(("Alpha", "shared-team"), self.reads)
-        self.assertFalse(account["active"], "usage does not prove a running Codex applied the login")
+        self.assertTrue(account["active"], "the active marker identifies the live email")
+        self.assertIsNone(self.S._selected_login_profile("codex"),
+                          "email alone does not bind this grant to the selected UUID")
 
     def test_live_login_never_supplies_another_persons_usage_in_same_workspace(self):
         self.S.BACKENDS["codex"].write_live(login("Unregistered", "unregistered", "new-grant"))
@@ -491,7 +914,7 @@ class UsagePicker(unittest.TestCase):
         self.assertIn("(press 's' to save this account)", head)
 
     def reset_provider(self, outcome="reset"):
-        from test_codex_resets import credit
+        from tests.test_codex_resets import credit
         native = self.S._http_json
         banks = {p["label"]: [credit("later-" + p["label"], "2099-11-01T00:00:00Z"),
                               credit("first-" + p["label"], "2099-10-22T19:09:47Z")]
@@ -610,7 +1033,8 @@ class UsagePicker(unittest.TestCase):
         banks["Alpha"] = []
         frames = self.picker([ord("t"), 27], height=14)
         self.assertFalse(any(f["modal"] for f in frames))
-        self.assertEqual(frames[-1]["lines"][13].strip(), "No resets available for this account.")
+        self.assertEqual(frames[-1]["lines"][13].split("Coffe <3", 1)[0].strip(),
+                         "No resets available for this account.")
         self.assertEqual(posts, [])
 
     def test_unknown_count_does_not_display_zero(self):

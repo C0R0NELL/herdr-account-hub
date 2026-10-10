@@ -11,9 +11,9 @@ What a profile holds (per agent kind):
           identity block out of ~/.claude.json
   codex   ~/.codex/auth.json
 
-Profiles live in this checkout's .local/profiles/<kind>/<uuid>.json, 0600 under
-a 0700 directory. They are password-equivalent secrets: same value as the files
-they came from, in the same place on the same machine, and never leave it.
+Profiles live in this plugin ID's durable Herdr state directory, 0600 under
+a 0700 directory. Development and production have separate stores outside the
+source checkout. Credentials are password-equivalent secrets and stay local.
 
 Subcommands:
   ui       the overlay picker (plugin pane entrypoint)
@@ -25,6 +25,7 @@ Subcommands:
   reauth   reauth <kind> <uuid> — replace only this record from the live login
 """
 import base64
+import errno
 import fcntl
 import getpass
 import hashlib
@@ -36,6 +37,7 @@ import random
 import re
 import signal
 import socket
+import stat
 import struct
 import subprocess
 import sys
@@ -48,24 +50,67 @@ from email.utils import parsedate_to_datetime
 import time
 import uuid
 
-PLUGIN_ID = os.environ.get("HERDR_PLUGIN_ID", "c0r0nell.account-hub")
 HERDR = os.environ.get("HERDR_BIN_PATH", "herdr")
 # Resolve the script rather than the caller's cwd or an inherited plugin path.
 ROOT = os.path.dirname(os.path.realpath(__file__))
-# Each checkout owns its private data. Herdr's injected state/config directories
-# and Account Switch's environment settings must not redirect Account Hub.
-STATE_DIR = os.path.expanduser(os.environ.get("ACCOUNT_HUB_STATE_DIR")
-                              or os.path.join(ROOT, ".local"))
+
+
+def _manifest_id(filename, default=None):
+    try:
+        import tomllib
+        with open(os.path.join(ROOT, filename), "rb") as handle:
+            value = tomllib.load(handle).get("id")
+        if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_.:-]+", value) and value not in (".", ".."):
+            return value
+    except (ImportError, OSError, ValueError):
+        pass
+    return default
+
+
+OFFICIAL_ID = _manifest_id("herdr-plugin.toml", "c0r0nell.account-hub")
+namespace, _, slug = OFFICIAL_ID.rpartition(".")
+DEVELOPMENT_ID = namespace + ".dev-" + slug
+_HOST_ID = os.environ.get("HERDR_PLUGIN_ID")
+_OWN_HOST = _HOST_ID in (OFFICIAL_ID, DEVELOPMENT_ID)
+PLUGIN_ID = (_HOST_ID if _OWN_HOST or os.environ.get("ACCOUNT_HUB_STATE_DIR") and _HOST_ID
+             else DEVELOPMENT_ID if _manifest_id("herdr-plugin.dev.toml") == DEVELOPMENT_ID
+             else OFFICIAL_ID)
+HERDR_CONFIG_BASE = os.path.join(os.path.expanduser(os.environ.get("XDG_CONFIG_HOME") or "~/.config"), "herdr")
+HERDR_STATE_BASE = os.path.join(os.path.expanduser(os.environ.get("XDG_STATE_HOME") or "~/.local/state"), "herdr")
+# Durable directories belong to the plugin ID, independent of its source path.
+# Ignore inherited host paths from unrelated plugins (for example the manager).
+STATE_DIR = os.path.abspath(os.path.expanduser(os.environ.get("ACCOUNT_HUB_STATE_DIR")
+    or (_OWN_HOST and os.environ.get("HERDR_PLUGIN_STATE_DIR"))
+    or os.path.join(HERDR_STATE_BASE, "plugins", PLUGIN_ID)))
 PROFILES_DIR = os.path.join(STATE_DIR, "profiles")
 BACKUP_DIR = os.path.join(STATE_DIR, "backups")
 LOCK = os.path.join(STATE_DIR, "switch.lock")
 SELECTION = os.path.join(STATE_DIR, "selection.json")
 KEEP_BACKUPS = 10
 IS_MAC = platform.system() == "Darwin"
+DONATE_URL = "https://github.com/sponsors/C0R0NELL?frequency=one-time&sponsor=C0R0NELL"
+SUPPORT_LABEL = "Coffe <3"
 
 
-CONFIG_DIR = os.path.expanduser(os.environ.get("ACCOUNT_HUB_CONFIG_DIR")
-                               or os.path.join(STATE_DIR, "config"))
+def _plugin_version():
+    """Read the official manifest beside this script, independent of the cwd."""
+    try:
+        import tomllib
+        with open(os.path.join(ROOT, "herdr-plugin.toml"), "rb") as handle:
+            version = tomllib.load(handle).get("version")
+    except (ImportError, OSError, ValueError):
+        return None
+    # Accept printable version text for client metadata.
+    if isinstance(version, str) and re.fullmatch(
+            r"[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?", version):
+        return version
+    return None
+
+
+CONFIG_DIR = os.path.abspath(os.path.expanduser(os.environ.get("ACCOUNT_HUB_CONFIG_DIR")
+    or (_OWN_HOST and os.environ.get("HERDR_PLUGIN_CONFIG_DIR"))
+    or (os.path.join(STATE_DIR, "config") if os.environ.get("ACCOUNT_HUB_STATE_DIR")
+        else os.path.join(HERDR_CONFIG_BASE, "plugins", "config", PLUGIN_ID))))
 PREFIX = "ACCOUNT_HUB_"
 
 
@@ -76,12 +121,15 @@ def _load_settings():
     can only be set by restarting herdr with it exported. A file in the config
     dir is the one place a person can actually change these.
     """
-    for name in ("config.toml", "config.json"):
-        path = os.path.join(CONFIG_DIR, name)
+    directories = [CONFIG_DIR]
+    if not os.environ.get("ACCOUNT_HUB_STATE_DIR") and not os.environ.get("ACCOUNT_HUB_CONFIG_DIR"):
+        directories.append(os.path.join(ROOT, ".local", "config"))
+    for path in (os.path.join(directory, name) for directory in directories
+                 for name in ("config.toml", "config.json")):
         if not os.path.exists(path):
             continue
         try:
-            if name.endswith(".toml"):
+            if path.endswith(".toml"):
                 import tomllib
                 with open(path, "rb") as handle:
                     return tomllib.load(handle)
@@ -328,6 +376,179 @@ def _write_json_secret(path, data, mode=0o600):
     finally:
         if os.path.exists(tmp):
             os.remove(tmp)
+
+
+# ---- durable storage and legacy upgrades ----------------------------------
+
+def _inside(path, parent):
+    return os.path.commonpath((os.path.realpath(path), os.path.realpath(parent))) == os.path.realpath(parent)
+
+
+def _storage_lock(path):
+    """Bounded exclusive flock for migration, without changing its inode."""
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise SwitchError("Storage lock contains an unexpected link; migration stopped") from None
+        raise
+    handle = os.fdopen(fd, "a")
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        handle.close()
+        raise SwitchError("Storage lock is not a regular file; migration stopped")
+    os.fchmod(fd, 0o600)
+    began = time.monotonic()
+    while True:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return handle
+        except BlockingIOError:
+            if time.monotonic() - began >= LOCK_TIMEOUT_S:
+                handle.close()
+                raise SwitchError("Storage migration is waiting for another operation; retry after it finishes")
+            time.sleep(0.05)
+
+
+def _legacy_storage_roots():
+    # Explicit stores (including test fixtures) never import checkout data.
+    if os.environ.get("ACCOUNT_HUB_STATE_DIR"):
+        return []
+    roots = [ROOT]
+    # Install-time builds run before the old checkout is removed. Find only
+    # this exact plugin ID in Herdr's registry, never another plugin's store.
+    registry_path = os.path.join(HERDR_CONFIG_BASE, "plugins.json")
+    if os.path.exists(registry_path):
+        try:
+            with open(registry_path) as handle:
+                registry = json.load(handle)
+            if not isinstance(registry, list):
+                raise ValueError()
+            roots += [item["plugin_root"] for item in registry
+                      if isinstance(item, dict) and item.get("plugin_id") == PLUGIN_ID
+                      and isinstance(item.get("plugin_root"), str)]
+        except (OSError, ValueError):
+            raise SwitchError("Cannot read the installed plugin registry; storage migration stopped") from None
+    return list(dict.fromkeys(os.path.realpath(root) for root in roots))
+
+
+def _private_tree(path, checkout):
+    """Keep secrets private without following the legacy dev source pointer."""
+    for directory, names, files in os.walk(path):
+        os.chmod(directory, 0o700)
+        for name in names + files:
+            item = os.path.join(directory, name)
+            if os.path.islink(item):
+                # An earlier local dev setup used .local/current -> checkout.
+                # Preserve that pointer as a link; never traverse or chmod it.
+                if directory == path and name == "current" and os.path.realpath(item) == checkout:
+                    continue
+                raise SwitchError("Legacy storage contains an unexpected link; migration stopped")
+        for name in files:
+            item = os.path.join(directory, name)
+            if os.path.islink(item):
+                continue
+            if not stat.S_ISREG(os.stat(item).st_mode):
+                raise SwitchError("Legacy storage contains an unsupported file; migration stopped")
+            os.chmod(item, 0o600)
+
+
+def _migrate_config(source):
+    if not os.path.isdir(source) or os.path.islink(source) or os.path.realpath(source) == CONFIG_DIR:
+        return
+    _secure_dir(CONFIG_DIR)
+    # No credential/config overwrites. A conflict must stop installation while
+    # both original copies are still available for an explicit decision.
+    for directory, names, files in os.walk(source):
+        target_dir = os.path.join(CONFIG_DIR, os.path.relpath(directory, source))
+        if os.path.islink(target_dir):
+            raise SwitchError("Durable config contains an unexpected link; migration stopped")
+        if os.path.exists(target_dir) and not os.path.isdir(target_dir):
+            raise SwitchError("Legacy and durable configuration differ; neither was replaced")
+        for name in names + files:
+            if os.path.islink(os.path.join(directory, name)) or os.path.islink(os.path.join(target_dir, name)):
+                raise SwitchError("Configuration contains an unexpected link; migration stopped")
+        for name in files:
+            old = os.path.join(directory, name)
+            new = os.path.join(CONFIG_DIR, os.path.relpath(old, source))
+            if os.path.exists(new):
+                if not os.path.isfile(new):
+                    raise SwitchError("Legacy and durable configuration differ; neither was replaced")
+                with open(old, "rb") as old_file, open(new, "rb") as new_file:
+                    if old_file.read() != new_file.read():
+                        raise SwitchError("Legacy and durable configuration differ; neither was replaced")
+    for directory, _, files in os.walk(source):
+        target_dir = os.path.join(CONFIG_DIR, os.path.relpath(directory, source))
+        _secure_dir(target_dir)
+        for name in files:
+            target = os.path.join(target_dir, name)
+            if not os.path.exists(target):
+                fd, temporary = tempfile.mkstemp(prefix=".migrate-", dir=target_dir)
+                try:
+                    with os.fdopen(fd, "wb") as output, open(os.path.join(directory, name), "rb") as original:
+                        output.write(original.read())
+                        output.flush()
+                        os.fsync(output.fileno())
+                    os.replace(temporary, target)
+                finally:
+                    if os.path.exists(temporary):
+                        os.remove(temporary)
+            os.chmod(target, 0o600)
+    backup = source + ".before-durable-" + str(uuid.uuid4())
+    os.rename(source, backup)
+    os.symlink(CONFIG_DIR, source, target_is_directory=True)
+
+
+def initialize_storage():
+    """Preserve legacy stores before source replacement, for dev and production."""
+    if _inside(STATE_DIR, ROOT) or _inside(CONFIG_DIR, ROOT):
+        raise SwitchError("Account storage must be outside the source checkout so updates preserve it")
+    _secure_dir(os.path.dirname(STATE_DIR))
+    migration_lock = _storage_lock(os.path.join(os.path.dirname(STATE_DIR),
+                                  "." + os.path.basename(STATE_DIR) + ".migration.lock"))
+    try:
+        for root in _legacy_storage_roots():
+            legacy = os.path.join(root, ".local")
+            if _inside(STATE_DIR, root) or _inside(CONFIG_DIR, root):
+                raise SwitchError("Account storage must be outside every source checkout so updates preserve it")
+            if os.path.islink(legacy):
+                if os.path.realpath(legacy) != os.path.realpath(STATE_DIR):
+                    raise SwitchError("Legacy storage points to another location; migration stopped")
+                continue
+            if not os.path.isdir(legacy):
+                continue
+            old_lock = _storage_lock(os.path.join(legacy, "switch.lock"))
+            try:
+                if os.path.exists(STATE_DIR) and os.listdir(STATE_DIR):
+                    raise SwitchError("Legacy and durable storage both contain data; neither was replaced")
+                # Validate before moving. rename preserves the legacy flock
+                # inode, so open old pickers keep sharing the same lock.
+                _private_tree(legacy, root)
+                if os.path.isdir(STATE_DIR):
+                    os.rmdir(STATE_DIR)
+                try:
+                    os.rename(legacy, STATE_DIR)
+                except OSError as exc:
+                    if exc.errno == errno.EXDEV:  # Copying would split live locks.
+                        raise SwitchError("Legacy storage is on another filesystem; close old pickers and move the data outside the checkout before updating") from None
+                    raise
+                try:
+                    os.symlink(STATE_DIR, legacy, target_is_directory=True)
+                except OSError:
+                    if not os.path.lexists(legacy):
+                        os.rename(STATE_DIR, legacy)
+                    raise
+            finally:
+                old_lock.close()
+        _secure_dir(STATE_DIR)
+        _migrate_config(os.path.join(STATE_DIR, "config"))
+        _secure_dir(CONFIG_DIR)
+    finally:
+        migration_lock.close()
+
+
+def cmd_storage_migrate(argv):
+    print(json.dumps({"state_dir": STATE_DIR, "config_dir": CONFIG_DIR, "plugin_id": PLUGIN_ID}))
+    return 0
 
 
 def _fingerprint(identity):
@@ -764,8 +985,8 @@ def _same_login(kind, profile, live):
                                 for k in ("access_token", "refresh_token"))
 
 
-def active_profile(kind, live=None):
-    """The explicitly selected UUID, provided its login is still live."""
+def _selected_login_profile(kind, live=None):
+    """Credential-sync target: explicit UUID and the same authentication grant."""
     backend = BACKENDS[kind]
     if live is None:
         live = backend.read_live()
@@ -780,20 +1001,44 @@ def active_profile(kind, live=None):
     return None
 
 
-def _live_account_saved(kind, live, profiles=None):
-    """Detect an existing account without selecting or changing any UUID.
+def _live_account_profiles(kind, live, profiles=None):
+    """Account identity is provider plus normalized email; UUIDs address storage.
 
-    A shared Codex workspace alone cannot identify a person. When person
-    metadata is absent, only an identical credential snapshot proves a match.
+    Missing email must never group people by a shared workspace or provider ID.
+    In that case only an identical credential snapshot establishes a match.
     """
     if live is None:
-        return False
-    identity = BACKENDS[kind].identity(live)
-    fingerprint = _fingerprint(identity)
-    known_person = kind != "codex" or identity.get("user_id") or identity.get("email")
+        return []
+    def email(identity):
+        value = identity.get("email")
+        return value.strip().casefold() if isinstance(value, str) else ""
+
+    live_email = email(BACKENDS[kind].identity(live))
     records = list_profiles(kind) if profiles is None else profiles
-    return any(p["payload"] == live or (fingerprint and known_person
-               and p["fingerprint"] == fingerprint) for p in records)
+    return [p for p in records if (email(p["identity"]) == live_email if live_email
+                                  else p["payload"] == live)]
+
+
+def active_profile(kind, live=None):
+    """Display the live email without requiring a previous plugin selection.
+
+    Legacy duplicates use the matching selected UUID, then prefer an original
+    registration over an automatic copy. This lookup never writes credentials
+    or changes selection and does not claim a daemon reload was verified.
+    """
+    if live is None:
+        live = BACKENDS[kind].read_live()
+    matches = _live_account_profiles(kind, live)
+    if not matches:
+        return None
+    selected = _selection().get(kind)
+    return next((p for p in matches if p["id"] == selected), None) or min(
+        matches, key=lambda p: (str(p["label"]).casefold().startswith("autosaved-"),
+                               p["payload"] != live, p.get("created_at") or 0, p["id"]))
+
+
+def _live_account_saved(kind, live, profiles=None):
+    return bool(_live_account_profiles(kind, live, profiles))
 
 
 def _backup(kind, payload):
@@ -821,7 +1066,7 @@ def switch(kind, key):
         if target is None:
             raise SwitchError(f"no {kind} profile named {key!r}")
         live = backend.read_live()
-        outgoing = active_profile(kind, live) if live is not None else None
+        outgoing = _selected_login_profile(kind, live) if live is not None else None
         runtime = backend.prepare_switch() if kind == "codex" else None
         if outgoing is not None and outgoing["id"] == target["id"] and runtime is None:
             sync_live_profile(kind, live)
@@ -834,10 +1079,10 @@ def switch(kind, key):
         target["payload"] = proven_payload(kind, target)
 
         if live is not None:
-            if outgoing is None:
+            if outgoing is None and not _live_account_saved(kind, live):
                 ident = backend.identity(live)
                 write_profile(make_profile(kind, "autosaved-" + default_label(kind, ident), live))
-            elif outgoing["id"] != target["id"]:
+            elif outgoing is not None and outgoing["id"] != target["id"]:
                 outgoing["payload"] = live
                 outgoing["identity"] = backend.identity(live)
                 outgoing["saved_at"] = int(time.time())
@@ -1244,7 +1489,7 @@ class CodexRPC:
         threading.Thread(target=self._reader, daemon=True).start()
         try:
             self.call("initialize", {"clientInfo": {
-                "name": "account_hub", "title": "Account Hub", "version": "0.2.0"},
+                "name": "account_hub", "title": "Account Hub", "version": _plugin_version() or "unknown"},
                 "capabilities": {"experimentalApi": False}})
             self.send({"method": "initialized"})
         except Exception:
@@ -1329,6 +1574,9 @@ USAGE_TTL_S = _num_env("ACCOUNT_HUB_USAGE_TTL_S", 120.0)
 USAGE_TIMEOUT_S = _num_env("ACCOUNT_HUB_USAGE_TIMEOUT_S", 8.0)
 # How long to leave an account alone after it answers 429.
 USAGE_BACKOFF_S = _num_env("ACCOUNT_HUB_USAGE_BACKOFF_S", 300.0)
+# Retry temporary reporting failures on later UI ticks, without blocking entry
+# or repeatedly retrying authentication. Exhaustion returns to the normal TTL.
+USAGE_RETRY_DELAYS_S = (5, 10, 20)
 BAR_WIDTH = int(_num_env("ACCOUNT_HUB_USAGE_BAR_WIDTH", 10))
 _BAR_CHARS = _setting("ACCOUNT_HUB_USAGE_BAR") or "█░"
 BAR_FULL = _BAR_CHARS[0]
@@ -1890,6 +2138,7 @@ def _remember_usage(key, windows):
     entry.update({"at": now, "windows": windows})
     entry.pop("retry_after", None)
     entry.pop("problem", None)
+    entry.pop("usage_retry", None)
     cache[key] = entry
     _secure_dir(STATE_DIR)
     _write_json_secret(USAGE_CACHE, cache)
@@ -1901,19 +2150,38 @@ def _rest_usage(key, seconds):
     entry = cache.get(key) or {}
     entry["retry_after"] = time.time() + seconds
     entry["problem"] = "rate limited"
+    entry.pop("usage_retry", None)
     cache[key] = entry
     _secure_dir(STATE_DIR)
     _write_json_secret(USAGE_CACHE, cache)
 
 
-def _usage_problem(key, problem):
+def _usage_problem(key, problem, retry=False):
     """Keep a failed read visible when another UI tick reloads the cache."""
     cache = _usage_cache()
     entry = cache.get(key) or {}
     entry["problem"] = problem
+    pending = entry.get("usage_retry")
+    delays = list(pending["remaining_delays"] if pending else USAGE_RETRY_DELAYS_S)
+    if retry:
+        if delays:
+            delay = delays.pop(0)
+        else:
+            delay, delays = USAGE_TTL_S, list(USAGE_RETRY_DELAYS_S)
+        entry["usage_retry"] = {
+            "after": time.time() + delay, "remaining_delays": delays,
+        }
+    else:
+        entry.pop("usage_retry", None)
     cache[key] = entry
     _secure_dir(STATE_DIR)
     _write_json_secret(USAGE_CACHE, cache)
+
+
+def _temporary_usage_failure(exc):
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code == 408 or 500 <= exc.code < 600
+    return isinstance(exc, (urllib.error.URLError, TimeoutError, ConnectionError))
 
 
 def _record_login_problem(key, reason, payload):
@@ -1997,12 +2265,16 @@ def _usage_rows(kinds=None, refresh=True, force=False):
             stale = (time.time() - (entry.get("at") or 0)) > USAGE_TTL_S
             follow_up = entry.get("reset_usage_refresh") or {}
             follow_up_due = bool(follow_up and time.time() >= follow_up["after"])
+            retry = entry.get("usage_retry") or {}
+            retry_due = bool(retry and time.time() >= retry["after"])
             resting = time.time() < (entry.get("retry_after") or 0)
             if resting:
                 problem = "rate limited"
-            attempted_read = refresh and (stale or force or follow_up_due) and not resting
+            attempted_read = (refresh and (stale or force or follow_up_due or retry_due)
+                              and not resting and (not retry or retry_due or force))
             if attempted_read:
                 problem = None
+                reading_usage = False
                 try:
                     # A parked account's token has usually expired, so renewing
                     # is what makes its numbers readable at all. The live one is
@@ -2010,6 +2282,7 @@ def _usage_rows(kinds=None, refresh=True, force=False):
                     if USAGE_RENEW and not from_live:
                         payload = renew_profile(kind, profile) or payload
                     try:
+                        reading_usage = True
                         windows = fetch_usage(kind, payload)
                     except urllib.error.HTTPError as exc:
                         # 401 on a token the clock still calls valid: the session
@@ -2018,9 +2291,11 @@ def _usage_rows(kinds=None, refresh=True, force=False):
                         # once — the server is the authority, not the expiry.
                         if exc.code != 401 or from_live or not USAGE_RENEW:
                             raise
+                        reading_usage = False
                         payload = renew_profile(kind, profile, force=True)
                         if not payload:
                             raise
+                        reading_usage = True
                         windows = fetch_usage(kind, payload)
                 except Exception as exc:
                     # Say why, briefly: this shares a narrow column with the
@@ -2036,7 +2311,8 @@ def _usage_rows(kinds=None, refresh=True, force=False):
                     elif problem is None:
                         problem = "unreachable" if isinstance(
                             exc, urllib.error.URLError) else type(exc).__name__
-                    _usage_problem(key, problem)
+                    _usage_problem(key, problem,
+                                   retry=reading_usage and _temporary_usage_failure(exc))
                     windows = None
             if windows is not None:
                 state = "live"
@@ -2053,7 +2329,12 @@ def _usage_rows(kinds=None, refresh=True, force=False):
             if attempted_read and follow_up_due:
                 _advance_reset_usage_refresh(key)
             reset_entry = _usage_cache().get(key) or {}
-            next_read = (reset_entry.get("reset_usage_refresh") or {}).get("after")
+            deadlines = [pending["after"] for name in ("reset_usage_refresh", "usage_retry")
+                         if (pending := reset_entry.get(name))]
+            next_read = min(deadlines) if deadlines else None
+            if next_read is not None:
+                next_read = max(next_read, (reset_entry.get("usage_retry") or {}).get("after", 0),
+                                reset_entry.get("retry_after") or 0)
             rows.append({
                 "kind": kind,
                 "id": profile["id"],
@@ -2067,8 +2348,7 @@ def _usage_rows(kinds=None, refresh=True, force=False):
                 "problem": login_problem or problem,
                 "reset_credits": reset_entry.get("reset_credits"),
                 "reset_credits_at": reset_entry.get("reset_credits_at"),
-                "refresh_after": max(next_read, reset_entry.get("retry_after") or 0)
-                                 if next_read is not None else None,
+                "refresh_after": next_read,
             })
     return rows
 
@@ -2314,7 +2594,7 @@ def _age(seconds):
 def sync_live_profile(kind, live=None):
     """Sync token rotation only into the selected UUID. Never discover or
     replace a record by provider id, workspace or email. Fresh Codex sessions
-    require explicit reauth; registration always appends a new record.
+    require explicit reauth. Account display matching does not permit syncing.
     """
     backend = BACKENDS.get(kind)
     if backend is None:
@@ -2327,7 +2607,7 @@ def sync_live_profile(kind, live=None):
     if live is None:
         return False
     with _Lock():
-        profile = active_profile(kind, live)
+        profile = _selected_login_profile(kind, live)
         if profile is None or profile.get("payload") == live:
             return False
         profile["payload"] = live
@@ -2517,6 +2797,8 @@ def login_codex(profile_id=None, label=None, browser=False):
                     _clear_staged("codex", profile["slug"])
                 _forget_profile_usage("codex", profile_id)
             else:
+                if _live_account_saved("codex", payload):
+                    return "Codex: account already saved; select it and press 'a' to sign in again"
                 profile = make_profile("codex", label or default_label("codex", identity), payload)
                 write_profile(profile)
     return f"Codex: saved login for {profile['label']}; Enter applies it to this machine"
@@ -2550,6 +2832,8 @@ def login_claude(label=None):
         if not identity.get("account_id") or not identity.get("email"):
             raise SwitchError("Cannot identify the signed-in Claude account; registration unchanged")
         with _Lock():
+            if _live_account_saved("claude", payload):
+                return "Claude: account already saved"
             profile = make_profile("claude", label or default_label("claude", identity), payload)
             write_profile(profile)
     return f"Claude: saved login for {profile['label']}; Enter applies it"
@@ -2790,11 +3074,13 @@ RESETS_W = 12
 RESETS_GAP = 4
 # Where the usage column starts: " " + mark + " " + label + " ".
 USAGE_COL = 3 + LABEL_W + 1
+RESETS_COL = USAGE_COL + USAGE_W + RESETS_GAP
 
 
 def _profile_line(kind, p, width, usage=None, problem=False, resets=None):
     backend = BACKENDS[kind]
     mark = "!" if problem else ("●" if p.get("_active") else " ")
+    leading = "●" if problem and p.get("_active") else " "
     desc = backend.describe(p.get("identity") or {})
     if p.get("_saved_hint"):
         desc = "saved " + p["_saved_hint"] + " | " + desc
@@ -2802,10 +3088,10 @@ def _profile_line(kind, p, width, usage=None, problem=False, resets=None):
     if resets is not None:
         desc = "%-*s %s" % (RESETS_W, resets[:RESETS_W], desc)
     if usage is None:
-        line = " %s %-*s %s" % (mark, LABEL_W, label, desc)
+        line = "%s%s %-*s %s" % (leading, mark, LABEL_W, label, desc)
     else:
-        line = " %s %-*s %-*s%s%s" % (
-            mark, LABEL_W, label, USAGE_W, usage[:USAGE_W], " " * RESETS_GAP, desc)
+        line = "%s%s %-*s %-*s%s%s" % (
+            leading, mark, LABEL_W, label, USAGE_W, usage[:USAGE_W], " " * RESETS_GAP, desc)
     return line[: max(0, width - 1)]
 
 
@@ -2835,6 +3121,77 @@ def _picker_help(width):
         else:
             lines.append(action)
     return lines
+
+
+def _emit_donate_link(y, x):
+    """Attach an OSC 8 URL after curses draws; restore its cursor and attributes.
+
+    Curses treats escape sequences as text, so emit the hyperlink separately.
+    The terminal/Herdr handles the click, including when the picker is on a VPS.
+    """
+    if not sys.stdout.isatty() or os.environ.get("TERM") == "dumb":
+        return
+    # refresh() can process SIGWINCH after layout was calculated. Never let a
+    # stale cursor position clamp to the last cell and scroll the whole pane.
+    try:
+        columns, rows = os.get_terminal_size(sys.stdout.fileno())
+    except (OSError, ValueError):
+        return
+    if not (0 <= y < rows and 0 <= x and x + len(SUPPORT_LABEL) < columns):
+        return
+    sys.stdout.write(
+        f"\x1b7\x1b[{y + 1};{x + 1}H\x1b]8;;{DONATE_URL}\x1b\\"
+        f"\x1b[38;2;255;95;175m\x1b[4m{SUPPORT_LABEL}\x1b[24m\x1b]8;;\x1b\\\x1b8")
+    sys.stdout.flush()
+
+
+def _picker_footer_layout(width):
+    """Reserve room for the link and one empty terminal column at the right."""
+    footer = SUPPORT_LABEL if len(SUPPORT_LABEL) <= width - 1 else ""
+    x = width - 1 - len(footer)
+    status_width = max(0, x - 2) if footer else max(0, width - 1)
+    return footer, x, status_width
+
+
+def _sync_picker_size(stdscr):
+    """Read the PTY before layout, including after work without a getch()."""
+    import curses
+    try:
+        columns, rows = os.get_terminal_size(sys.stdout.fileno())
+    except (OSError, ValueError):
+        return False
+    if rows > 0 and columns > 0 and stdscr.getmaxyx() != (rows, columns):
+        curses.resizeterm(rows, columns)
+        stdscr.clearok(True)
+        return True
+    return False
+
+
+def _restore_picker(stdscr):
+    """Discard physical-screen assumptions after overlays or external output."""
+    _sync_picker_size(stdscr)
+    stdscr.clearok(True)
+    stdscr.touchwin()
+    stdscr.refresh()
+
+
+def _picker_footer(stdscr, message="", attr=None):
+    """Keep status on the left and the support link on the right, without overlap."""
+    import curses
+    _sync_picker_size(stdscr)
+    h, w = stdscr.getmaxyx()
+    if h < 2:
+        stdscr.refresh()
+        return
+    footer, x, status_width = _picker_footer_layout(w)
+    if status_width:
+        stdscr.addnstr(h - 1, 0, message.ljust(status_width), status_width,
+                      curses.A_BOLD if attr is None else attr)
+    if footer:
+        stdscr.addnstr(h - 1, x, footer, len(footer), curses.A_UNDERLINE)
+    stdscr.refresh()
+    if footer:
+        _emit_donate_link(h - 1, x)
 
 
 def summary_window(row):
@@ -3076,6 +3433,7 @@ def usage_summary(row):
 def _center_win(stdscr, height, width):
     import curses
 
+    _sync_picker_size(stdscr)
     h, w = stdscr.getmaxyx()
     height, width = min(height, h), min(width, w)
     win = curses.newwin(
@@ -3083,6 +3441,50 @@ def _center_win(stdscr, height, width):
     )
     win.keypad(True)
     return win
+
+
+def _mouse_click(win):
+    """Return a plain left-click in this window's local coordinates."""
+    import curses
+    try:
+        _, x, y, _, state = curses.getmouse()
+    except curses.error:
+        return None
+    modifiers = curses.BUTTON_SHIFT | curses.BUTTON_CTRL | curses.BUTTON_ALT
+    if not state & curses.BUTTON1_CLICKED or state & modifiers:
+        return None
+    origin_y, origin_x = win.getbegyx()
+    height, width = win.getmaxyx()
+    x, y = x - origin_x, y - origin_y
+    return (x, y) if 0 <= x < width and 0 <= y < height else None
+
+
+def _modal_hint(win, row, inner, hint="enter | esc"):
+    """Underline clickable actions while retaining their keyboard labels."""
+    import curses
+    win.addnstr(row, 2, hint, inner, curses.A_DIM)
+    for text in ("enter", "esc"):
+        start = hint.index(text)
+        count = min(len(text), inner - start)
+        if count > 0:
+            win.addnstr(row, 2 + start, text, count, curses.A_UNDERLINE | curses.A_BOLD)
+
+
+def _modal_input(win, hint_row, hint="enter | esc"):
+    """Route visible button clicks through the existing Enter/Esc handling."""
+    import curses
+    ch = win.getch()
+    if ch != curses.KEY_MOUSE:
+        return ch, None
+    click = _mouse_click(win)
+    if click and click[1] == hint_row:
+        inner = win.getmaxyx()[1] - 4
+        for text, key in (("enter", 10), ("esc", 27)):
+            start = hint.index(text)
+            if 2 + start <= click[0] < 2 + min(start + len(text), inner):
+                return key, click
+    # An unrelated mouse event never confirms or cancels a modal.
+    return None, click
 
 
 def _ask(stdscr, title, question, initial=""):
@@ -3103,9 +3505,11 @@ def _ask(stdscr, title, question, initial=""):
             win.addnstr(0, 2, " %s " % title, inner, curses.A_BOLD)
             win.addnstr(2, 2, question, inner, curses.A_BOLD)
             win.addnstr(4, 2, "> " + "".join(buf) + "_", inner)
-            win.addnstr(6, 2, hint, inner, curses.A_DIM)
+            _modal_hint(win, 6, inner, hint)
             win.refresh()
-            ch = win.getch()
+            ch, _ = _modal_input(win, 6, hint)
+            if ch is None:
+                continue
             if ch == 27:
                 return None
             if ch in (curses.KEY_ENTER, 10, 13):
@@ -3116,12 +3520,11 @@ def _ask(stdscr, title, question, initial=""):
             elif 32 <= ch < 127:
                 buf.append(chr(ch))
     finally:
-        stdscr.touchwin()
-        stdscr.refresh()
+        _restore_picker(stdscr)
 
 
 def _confirm(stdscr, title, question, note=None):
-    """Centered confirmation. Only Enter confirms; Esc/other keys cancel."""
+    """Centered confirmation with Enter/Esc keys and clickable action labels."""
     import curses
 
     hint = "enter | esc"
@@ -3131,20 +3534,22 @@ def _confirm(stdscr, title, question, note=None):
     )
     height = 9 if note else 7
     try:
-        win = _center_win(stdscr, height, width)
-        win.erase()
-        win.box()
-        inner = width - 4
-        win.addnstr(0, 2, " %s " % title, inner, curses.A_BOLD)
-        win.addnstr(2, 2, question, inner, curses.A_BOLD)
-        if note:
-            win.addnstr(4, 2, note, inner, curses.A_DIM)
-        win.addnstr(height - 2, 2, hint, inner, curses.A_DIM)
-        win.refresh()
-        return win.getch() in (curses.KEY_ENTER, 10, 13)
+        while True:
+            win = _center_win(stdscr, height, width)
+            win.erase()
+            win.box()
+            inner = width - 4
+            win.addnstr(0, 2, " %s " % title, inner, curses.A_BOLD)
+            win.addnstr(2, 2, question, inner, curses.A_BOLD)
+            if note:
+                win.addnstr(4, 2, note, inner, curses.A_DIM)
+            _modal_hint(win, height - 2, inner, hint)
+            win.refresh()
+            ch, _ = _modal_input(win, height - 2, hint)
+            if ch is not None:
+                return ch in (curses.KEY_ENTER, 10, 13)
     finally:
-        stdscr.touchwin()
-        stdscr.refresh()
+        _restore_picker(stdscr)
 
 
 def _choose(stdscr, title, options):
@@ -3164,9 +3569,13 @@ def _choose(stdscr, title, options):
             for index, (_, label) in enumerate(options):
                 win.addnstr(index + 2, 2, label.ljust(inner), inner,
                             curses.A_REVERSE if index == selected else curses.A_NORMAL)
-            win.addnstr(len(options) + 4, 2, hint, inner, curses.A_DIM)
+            _modal_hint(win, len(options) + 4, inner, hint)
             win.refresh()
-            ch = win.getch()
+            ch, click = _modal_input(win, len(options) + 4, hint)
+            if ch is None:
+                if click and 2 <= click[0] < width - 2 and 2 <= click[1] < len(options) + 2:
+                    selected = click[1] - 2
+                continue
             if ch == 27:
                 return None
             if ch in (curses.KEY_ENTER, 10, 13):
@@ -3176,8 +3585,7 @@ def _choose(stdscr, title, options):
             elif ch in (curses.KEY_UP, ord("k")):
                 selected = max(selected - 1, 0)
     finally:
-        stdscr.touchwin()
-        stdscr.refresh()
+        _restore_picker(stdscr)
 
 
 def _ui_login(stdscr, kind, profile_id=None, label=None):
@@ -3196,8 +3604,7 @@ def _ui_login(stdscr, kind, profile_id=None, label=None):
     finally:
         curses.reset_prog_mode()
         curses.curs_set(0)
-        stdscr.touchwin()
-        stdscr.refresh()
+        _restore_picker(stdscr)
 
 
 def _ui_codex_login(stdscr, profile_id=None, label=None):
@@ -3206,6 +3613,7 @@ def _ui_codex_login(stdscr, profile_id=None, label=None):
 
 def cmd_ui(argv):
     import curses
+    mouse_enabled = False
 
     def run(stdscr):
         curses.curs_set(0)
@@ -3218,6 +3626,7 @@ def cmd_ui(argv):
         scroll = 0
         message = ""
         details = False
+        pending_action = None
         # Opening requests fresh usage, even if a recent cache lacks new fields.
         # Later ticks follow the TTL or scheduled post-reset checks. Every read
         # still observes each account's Retry-After.
@@ -3225,6 +3634,7 @@ def cmd_ui(argv):
         usage_fetched = time.time()
         usage_profiles = set(usage)
         while True:
+            _sync_picker_size(stdscr)
             rows = _rows()
             profile_keys = {"%s:%s" % (kind, body["id"])
                             for row_type, kind, body in rows if row_type == "profile"}
@@ -3261,6 +3671,7 @@ def cmd_ui(argv):
             navigation_y = 1 + len(help_lines)
             list_y = navigation_y + 1
             lines = []
+            account_lines = {}
             selected_span = None
             for i, (kind_row, kind, body) in enumerate(rows):
                 start = len(lines)
@@ -3279,8 +3690,10 @@ def cmd_ui(argv):
                     # account line would only repeat one of them.
                     text, sev = ("", "ok") if details else usage_summary(row)
                     problem = bool(row and row.get("problem"))
+                    resets = reset_summary(kind, row)
                     line = _profile_line(kind, body, w, text, problem=problem,
-                                         resets=reset_summary(kind, row)).ljust(w - 1)
+                                         resets=resets).ljust(w - 1)
+                    account_lines[start] = ((kind, body["id"]), resets)
                     lines.append((line, curses.A_REVERSE if is_sel else curses.A_NORMAL,
                                   (text, sev) if text and not is_sel else None, problem))
                     if details:
@@ -3299,6 +3712,7 @@ def cmd_ui(argv):
                 elif end > scroll + available:
                     scroll = min(start, end - available)
             scroll = max(0, min(scroll, max(0, len(lines) - available)))
+            mouse_targets = {}
             for y, (line, attr, coloured_usage, problem) in enumerate(
                     lines[scroll:scroll + available], start=list_y):
                 stdscr.addnstr(y, 0, line.ljust(w - 1), w - 1, attr)
@@ -3308,6 +3722,14 @@ def cmd_ui(argv):
                     text, sev = coloured_usage
                     stdscr.addnstr(y, USAGE_COL, text, w - 1 - USAGE_COL,
                                    pairs.get(sev, 0))
+                target = account_lines.get(scroll + y - list_y)
+                if target:
+                    key, resets = target
+                    # The whole account row switches, except the complete
+                    # Codex reset column (including its padding).
+                    mouse_targets[y] = ([(RESETS_COL, min(RESETS_COL + RESETS_W, w - 1),
+                                          key, ord("t"))] if resets else [])
+                    mouse_targets[y].append((0, w - 1, key, 10))
             if navigation_y < h - 1 and len(lines) > available:
                 navigation = "j/k scroll"
                 if scroll:
@@ -3315,20 +3737,39 @@ def cmd_ui(argv):
                 if scroll + available < len(lines):
                     navigation += " | ↓ more below"
                 stdscr.addnstr(navigation_y, 0, navigation, w - 1, curses.A_DIM)
-            if message and h > 1:
-                stdscr.addnstr(h - 1, 0, message[: w - 1], w - 1, curses.A_BOLD)
-            elif h > 1 and any(usage_notice(r) for r in usage.values()):
-                stdscr.addnstr(h - 1, 0, "~ last known usage | d details", w - 1, curses.A_DIM)
-            stdscr.refresh()
+            notice = "~ last known usage | d details" if any(
+                usage_notice(r) for r in usage.values()) else ""
+            _picker_footer(stdscr, message or notice,
+                           curses.A_BOLD if message else curses.A_DIM)
 
-            try:
-                ch = stdscr.getch()
-            except KeyboardInterrupt:
-                return
+            if pending_action:
+                target_key, ch = pending_action
+                pending_action = None
+                # A registration removed between click and redraw must never
+                # apply the action to whichever account now occupies its row.
+                if target_key != selected_key:
+                    continue
+            else:
+                try:
+                    ch = stdscr.getch()
+                except KeyboardInterrupt:
+                    return
             if ch == -1:
                 continue
             if ch in (ord("q"), 27):
                 return
+            if mouse_enabled and ch == curses.KEY_MOUSE:
+                click = _mouse_click(stdscr)
+                if click:
+                    x, y = click
+                    for left, right, key, action in mouse_targets.get(y, []):
+                        if left <= x < right:
+                            selected_key = key
+                            pending_action = (key, action)
+                            break
+                # Redraw the clicked selection before entering the existing
+                # keyboard confirmation path. Other cells have no action.
+                continue
 
             row = rows[pickable[sel]] if pickable else None
             # A row is only a profile when it isn't the "nothing saved" filler.
@@ -3344,25 +3785,33 @@ def cmd_ui(argv):
                 selected_key = keys[sel]
             elif ch in (curses.KEY_ENTER, 10, 13) and selected:
                 profile = selected[2]
-                if selected[1] == "codex" and not _confirm(
-                        stdscr, "Switch Codex account",
+                if not _confirm(
+                        stdscr, "Switch " + BACKENDS[selected[1]].short + " account",
                         f"Switch to {profile['label']} ?",
-                        "Reload open chats; keep history and titles."):
+                        "Reload open chats; keep history and titles."
+                        if selected[1] == "codex" else None):
                     message = "Account change cancelled"
                     continue
                 try:
                     if selected[1] == "codex":
+                        _sync_picker_size(stdscr)
+                        h, w = stdscr.getmaxyx()
                         title = "Switching Codex account and reloading chats..."
                         note = "(Daemon may wait for active work)"
                         progress = title + " " + note
-                        progress_lines = ([progress] if len(progress) < w else [title, note])[-h:]
-                        for index, line in enumerate(progress_lines):
+                        progress_width = _picker_footer_layout(w)[2]
+                        progress_lines = ([progress] if len(progress) <= progress_width
+                                          else [title, note])[-h:]
+                        for index, line in enumerate(progress_lines[:-1]):
                             stdscr.addnstr(h - len(progress_lines) + index, 0,
                                           line.ljust(w - 1), w - 1, curses.A_BOLD)
-                        stdscr.refresh()
+                        _picker_footer(stdscr, progress_lines[-1])
                     message = switch(selected[1], profile["id"])
                 except SwitchError as exc:
                     message = str(exc)
+                finally:
+                    _sync_picker_size(stdscr)
+                    stdscr.clearok(True)
             elif ch == ord("u"):
                 provider = _choose(stdscr, "Add new account",
                                    [("codex", "Codex"), ("claude", "Claude (beta)")])
@@ -3441,9 +3890,7 @@ def cmd_ui(argv):
             elif ch == ord("t") and selected:
                 profile = selected[2]
                 try:
-                    stdscr.addnstr(h - 1, 0, "Checking resets...".ljust(w - 1),
-                                  w - 1, curses.A_BOLD)
-                    stdscr.refresh()
+                    _picker_footer(stdscr, "Checking resets...")
                     attempt = prepare_reset(selected[1], profile["id"])
                     expiry = attempt["credit"]["expires_at"]
                     note = ("Expires: " + datetime.fromtimestamp(expiry, timezone.utc).strftime(
@@ -3451,18 +3898,16 @@ def cmd_ui(argv):
                     if not _confirm(stdscr, "Use reset", f"Use a reset for {profile['label']} ?", note):
                         message = "Reset cancelled"
                         continue
-                    stdscr.addnstr(h - 1, 0, "Using reset...".ljust(w - 1),
-                                  w - 1, curses.A_BOLD)
-                    stdscr.refresh()
+                    _picker_footer(stdscr, "Using reset...")
                     message = consume_reset(attempt)
                 except SwitchError as exc:
                     message = str(exc)
                 except OSError:
                     message = "Cannot save reset state; result not confirmed. Press 't' to retry."
             elif ch == ord("r"):
+                stdscr.clearok(True)
                 message = "refreshing accounts…"
-                stdscr.addnstr(h - 1, 0, message.ljust(w - 1), w - 1, curses.A_BOLD)
-                stdscr.refresh()
+                _picker_footer(stdscr, message)
                 usage = {"%s:%s" % (r["kind"], r["id"]): r for r in usage_rows(force=True)}
                 usage_fetched = time.time()
                 usage_profiles = set(usage)
@@ -3485,7 +3930,25 @@ def cmd_ui(argv):
                     message = f"deleted {profile['label']}"
                     sel = max(0, sel - 1)
 
-    curses.wrapper(run)
+    def with_mouse(stdscr):
+        nonlocal mouse_enabled
+        old_mask = None
+        if hasattr(curses, "mousemask"):
+            try:
+                available, old_mask = curses.mousemask(curses.BUTTON1_CLICKED)
+                mouse_enabled = bool(available & curses.BUTTON1_CLICKED)
+            except curses.error:
+                pass
+        try:
+            run(stdscr)
+        finally:
+            if old_mask is not None:
+                try:
+                    curses.mousemask(old_mask)
+                except curses.error:
+                    pass
+
+    curses.wrapper(with_mouse)
     return 0
 
 
@@ -3497,6 +3960,7 @@ NOTIFY_FAILURE = {"next": "switch", "switch": "switch", "save": "save", "reauth"
                   "codex-login": "sign in"}
 
 DISPATCH = {
+    "storage-migrate": cmd_storage_migrate,
     "ui": cmd_ui,
     "open": cmd_open,
     "next": cmd_next,
@@ -3515,6 +3979,11 @@ def main():
         print(f"usage: switcher.py {{{'|'.join(DISPATCH)}}} [args]", file=sys.stderr)
         return 2
     try:
+        try:
+            initialize_storage()
+        except OSError as exc:
+            raise SwitchError("Storage initialization failed (%s); account actions were not started" %
+                              (exc.strerror or "filesystem error")) from None
         return DISPATCH[sys.argv[1]](sys.argv[2:]) or 0
     except SwitchError as exc:
         print(f"account-hub: {exc}", file=sys.stderr)

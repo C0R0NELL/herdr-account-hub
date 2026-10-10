@@ -2,9 +2,11 @@ __pycache__/
 *.py[cod]
 *.log
 .DS_Store
+.git
+/.herdr-web-ui/
 
 # Local credentials and account state must never be committed.
-/.local/
+/.local
 /herdr-plugin.dev.toml
 .env
 .env.*

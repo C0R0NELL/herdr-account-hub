@@ -1,5 +1,6 @@
 ---
-date: 2026-09-07
+module: account-hub
+date: 2026-10-10
 problem_type: runtime_error
 component: usage
 tags: [claude, usage, rate-limit, cache]
@@ -7,42 +8,26 @@ tags: [claude, usage, rate-limit, cache]
 
 # Evidence
 
-Mindera's Claude session hit its usage limit while the picker showed 0%.
-Its cached session reading was about two hours old and a `retry_after` entry
-showed that usage reads had been throttled. Personal had a recent reading.
-
-A direct, read-only comparison using the saved, unexpired tokens then returned:
-
-- Personal: HTTP 429, `Retry-After: 201`, `rate_limit_error` with the message
-  `Rate limited. Please try again later.`
-- Mindera: HTTP 200, session 100%, weekly 65%, model weekly 52%.
-
-No token refresh or login change was required. This establishes that Mindera's
-token and the parser can retrieve its real usage, and that Personal can also
-be throttled. It does not establish the provider's rate-limit scope or why
-Mindera's reporting requests were throttled for longer.
-
-The installed ccstatusline can query the same endpoint, with its own 180-second
-cache, when Claude's status-line input lacks required usage fields. This is
-another possible source of reporting requests, not proof that it caused this
-incident. Its cache is token-keyed; never attribute its values to an account
-merely because that account is currently selected.
+A fake HTTP fixture reproduces a two-hour-old 0% usage reading followed by
+HTTP 429. Account Hub retains the last known percentage, marks it stale, and
+records the reporting error and retry deadline. Separate fixtures establish
+numeric and HTTP-date `Retry-After` handling. These are local regressions, not
+measurements of a real Claude account or proof of a provider's rate-limit scope.
 
 # Local defects and changes
 
 - The switch verifier fetched usage and discarded it. Successful verification
   now saves the reading, and a 429 records its cooldown for usage readers.
-- An open picker never fetched again unless the user pressed `u`. Both usage
-  views now refresh at the cache interval, respecting each account's backoff.
+- The picker refreshes while open, respecting each account's backoff. Manual
+  refresh covers the whole list rather than only the selected account.
 - Every 429 previously imposed a fixed five-minute wait. The switcher now
   honors numeric and HTTP-date `Retry-After` values, with five minutes as the
   fallback for missing or unusable values.
 - Old percentages were displayed without age or error in the picker. The
   collapsed view keeps the bar and countdown with a `~` before the last known
-  percentage; expanded usage shows the age and refresh error. An earlier fix
-  replaced the percentage with the error, which hid useful capacity information.
+  percentage; expanded usage shows the age and refresh error.
 
-Regression checks in `test_switcher.py` use fake HTTP and credential stores.
+Regression checks in `tests/check_switcher.py` use fake HTTP and credential stores.
 They cover saving and reusing verification reads, sharing verification backoff,
 retry delays, stale-zero presentation, and aging a reading while the picker
 remains open. These changes improve recovery and reduce duplicate reads; they
@@ -50,16 +35,15 @@ cannot guarantee that Anthropic's reporting endpoint will accept a request.
 
 # Independent collection and concurrent readers
 
-A later attempt imported ccstatusline's token-matched local cache. That was
-removed: this plugin must collect usage independently of status-line plugins.
-The switcher uses the authenticated provider endpoint and its own cache only.
+Account Hub uses the authenticated provider endpoint and its own UUID-keyed
+cache. It does not import readings from other plugins or status-line caches.
 
 Code inspection found that concurrent picker/usage processes could both read
 an expired cache before either recorded its HTTP result, causing duplicate
 requests. Usage collection now takes the existing re-entrant process lock
 before reading the cache, fetching, and recording a result or cooldown. A
-waiting reader therefore sees the preceding reader's update. Both panes also
-reload the plugin's own cache on UI ticks to observe reads from other actions.
+waiting reader therefore sees the preceding reader's update. The picker reloads
+the plugin's own cache on UI ticks to observe reads from other actions.
 
 Regression tests start two processes simultaneously with fake HTTP and verify
 exactly one request per account, both for successful reads and HTTP 429s.
@@ -77,10 +61,11 @@ the selected account visible. Selection follows `(kind, UUID)`, rather than its
 position in a changing list. Legacy records no longer move when renewal updates
 `saved_at`.
 
-A fake endpoint reproduced stale reads after pressing `u`: recent cache entries
-prevented any request. Explicit picker/panel refresh now bypasses the normal
-TTL, preserving provider cooldowns. New registrations are detected on UI ticks
-and their readings are collected without waiting for the old list's timer.
+A fake endpoint reproduced stale reads after explicit refresh: recent cache
+entries prevented any request. Explicit picker refresh now bypasses the normal
+TTL, preserving provider cooldowns. The picker's refresh action is **r**.
+New registrations are detected on UI ticks and their readings are collected
+without waiting for the old list's timer.
 Errors persist in each UUID's cache entry until successful collection, so a
 later cache-only tick does not remove a failed-read warning.
 
@@ -93,7 +78,7 @@ UUID. Another person in the same workspace cannot supply that account's usage.
 The save prompt appears only for an absent identity and reads
 `(press 's' to save this account)`.
 
-`test_usage_picker.py`, included by `python3 -B test_switcher.py`, reproduces
+`tests/test_usage_picker.py`, included by `python3 -B test_switcher.py`, reproduces
 clipped accounts, expanded-row scrolling, selection drift, stale explicit
 refresh, new registrations, fresh live authentication, and persistent errors.
 It also checks five distinct users with identical labels in one workspace,
@@ -112,6 +97,6 @@ initial `usage_rows()` honoring the normal TTL.
 The initial read now bypasses the TTL, like `r`, while preserving each UUID's
 provider cooldown. Subsequent idle ticks still reuse cached readings until
 the normal interval or a scheduled post-reset check. Fake HTTP regressions in
-`test_usage_picker.py` verify fresh percentages/counts on the first frame,
+`tests/test_usage_picker.py` verify fresh percentages/counts on the first frame,
 reopening, no repeated request on the next idle tick, and refreshing the other
 four accounts while one is in cooldown. No real credentials or resets were used.

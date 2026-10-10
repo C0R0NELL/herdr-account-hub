@@ -1,4 +1,5 @@
 ---
+module: account-hub
 date: 2026-10-10
 problem_type: integration
 component: earned-resets
@@ -46,7 +47,8 @@ that hint or claim it proves rejection.
   dated credits and show `Expires: not provided` when necessary.
 - Fail without consuming if complete expiry details cannot be determined.
 - Preparing/canceling performs no redemption. Persist the operation UUID to
-  `.local/reset-attempts.json` (0600, inside 0700 state) only after Enter and
+  `reset-attempts.json` in the durable plugin state directory (0600, inside
+  0700 state) only after Enter and
   before POST. If that write fails, send no POST.
 - A lost response leaves the journal pending. A retry uses the same opaque
   credit ID and operation UUID even if the credit is now absent from GET.
@@ -59,8 +61,8 @@ that hint or claim it proves rejection.
 
 # Verification limits
 
-`python3 -B test_switcher.py` includes `test_codex_resets.py` and
-`test_usage_picker.py`. They use fictitious credentials/provider responses:
+`python3 -B test_switcher.py` includes `tests/test_codex_resets.py` and
+`tests/test_usage_picker.py`. They use fictitious credentials/provider responses:
 earliest expiry, tied choice, unavailable/malformed/capped details, cancellation,
 account isolation in a shared workspace, confirmation expiry, two simultaneous
 processes, lost-response recovery from a fresh module, file permissions and the

@@ -13,7 +13,7 @@ import unittest
 import urllib.error
 from unittest.mock import patch
 
-from test_account_records import login
+from tests.test_account_records import login
 
 
 def credit(key, expires, status="available", reset_type="codex_rate_limits"):
@@ -31,7 +31,7 @@ class CodexResets(unittest.TestCase):
         })
         self.env.start()
         spec = importlib.util.spec_from_file_location(
-            "resets_hub", Path(__file__).with_name("switcher.py"))
+            "resets_hub", Path(__file__).resolve().parents[1] / "switcher.py")
         self.S = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(self.S)
         self.native_http = self.S._http_json
@@ -279,7 +279,7 @@ class CodexResets(unittest.TestCase):
         self.assertIn("unconfirmed", row["problem"])
         # Fresh module/process state: the operation survives only on disk.
         spec = importlib.util.spec_from_file_location(
-            "resets_hub_after_restart", Path(__file__).with_name("switcher.py"))
+            "resets_hub_after_restart", Path(__file__).resolve().parents[1] / "switcher.py")
         self.S = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(self.S)
         self.S._http_json = self.http

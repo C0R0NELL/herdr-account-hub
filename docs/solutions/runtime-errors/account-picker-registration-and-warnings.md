@@ -22,19 +22,22 @@ accounts also lacked a visible indicator next to their names.
   instructions, automatic-save notice, cancellation key and 15-minute limit.
 - Official sign-in runs in an empty, private temporary credential directory.
   The plugin waits for CLI success, validates the resulting credential/account
-  shape, and stores a new UUID automatically. It never calls `save_live` or
+  shape, and stores a new UUID automatically if the email is not registered.
+  An existing email returns `account already saved`, preserving the original
+  credentials and UUID. It never calls `save_live` or
   applies that login to the shared history home during registration.
 - Ctrl+C cancels. `subprocess.run(timeout=900)` kills and waits for the CLI if
   it times out. Failure, cancellation and timeout never create a registration,
   even if the CLI wrote partial credentials; the temporary directory is removed.
 - `r` refreshes the whole picker. `c` remains a compatibility Codex shortcut.
-- `s` saves the current account only when absent. An existing person/workspace
+- `s` saves the current account only when absent. An existing normalized email
   shows `Account already saved`, without asking for a name or changing a UUID,
   credentials, selection or refusal cache. Recover an existing registration
   with `a`; manual save is not reauthentication.
 - A known account error has a red `!` in the marker column, including on the
   selected row and in expanded mode. Healthy usage percentages do not trigger
   it. Details retain the reason, and monochrome terminals retain the symbol.
+  The current-account dot remains visible beside `!` when both apply.
 - A refusal during switching is cached by registration UUID and credential
   payload hash, separately from usage reporting failures. A new live grant for
   the same person must not clear a refusal of the saved grant merely by reading
@@ -74,6 +77,6 @@ remains available. Claude remains beta: no actual Claude account was tested.
   no login and makes no network requests.
 
 `ACCOUNT_HUB_TEST_REAL_CODEX=1 python3 -B -m unittest
-test_codex_login.RealCodexLogin.test_native_login_revokes_existing_store_but_plugin_login_preserves_it`
+tests.test_codex_login.RealCodexLogin.test_native_login_revokes_existing_store_but_plugin_login_preserves_it`
 also passed after adding the timeout. Its credentials are fictitious and
 external connections are blocked.

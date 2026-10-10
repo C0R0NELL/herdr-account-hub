@@ -10,7 +10,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from test_account_records import login
+from tests.test_account_records import login
 
 
 class _LoginFixture(unittest.TestCase):
@@ -24,7 +24,7 @@ class _LoginFixture(unittest.TestCase):
             "ACCOUNT_HUB_CONFIG_DIR": str(Path(self.temp.name, "config")),
         })
         self.env.start()
-        spec = importlib.util.spec_from_file_location("login_hub", Path(__file__).with_name("switcher.py"))
+        spec = importlib.util.spec_from_file_location("login_hub", Path(__file__).resolve().parents[1] / "switcher.py")
         self.S = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(self.S)
         self.S.notify = lambda *a: None
@@ -57,13 +57,13 @@ class _LoginFixture(unittest.TestCase):
         return subprocess.CompletedProcess(argv, 0)
 
 class CodexLogin(_LoginFixture):
-    def test_add_new_can_explicitly_register_a_saved_person_without_replacing_it(self):
+    def test_add_new_skips_an_email_already_saved_without_replacing_it(self):
         self.new = login("one", "another-grant", "another-session")
         with patch.object(self.S.subprocess, "run", side_effect=self.official_login):
-            self.S.login_codex(label="One again")
+            message = self.S.login_codex(label="One again")
         profiles = self.S.list_profiles("codex")
-        self.assertEqual(len(profiles), 2)
-        self.assertEqual(len({p["id"] for p in profiles}), 2)
+        self.assertEqual(len(profiles), 1)
+        self.assertIn("already saved", message)
         self.assertEqual(self.S.get_profile("codex", self.profile["id"]), self.profile)
         self.assertEqual(self.S.BACKENDS["codex"].read_live(), self.current)
         self.assertEqual(self.S._selection()["codex"], self.profile["id"])

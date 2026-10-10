@@ -1,6 +1,6 @@
 ---
-module: ":account-switch"
-date: 2026-08-24
+module: account-hub
+date: 2026-10-09
 problem_type: runtime_error
 component: datastore
 severity: high
@@ -8,11 +8,9 @@ symptoms:
   - "A saved profile installs cleanly, the switch reports success, and the agent is signed out"
   - "A parked profile's access token is still valid by its own exp claim, but the provider answers 401"
   - "codex: a profile stops working with no switch, no renewal and no action by this plugin"
-  - "codex: a profile stops working right after that account's plan changes"
-  - "the only sign is an account badge that does not change"
 root_cause: logic_error
 resolution_type: code_fix
-tags: [oauth, refresh-token, revocation, codex, claude-code, credential-store, plan-change]
+tags: [oauth, refresh-token, revocation, codex, credential-store]
 ---
 # Problem
 
@@ -22,43 +20,13 @@ agent uses it. `switch()` used to read the store back and compare the account
 identity, which proves the write landed and says nothing about whether the login
 still signs in.
 
-Four provider rules cause it:
+## Evidence: Codex sign-in revocation
 
-**A refresh token is single-use and rotates.** Renewing spends the stored one and
-the reply carries its replacement. Reusing a spent token is permanent — the
-provider answers `refresh_token_reused` and that chain is finished, which costs a
-browser login to repair.
-
-**A refusal is definitive only when the provider says so in words:**
-
-| status | code | meaning |
-|---|---|---|
-| 401 | `token_revoked` | the grant was revoked, whatever the token's `exp` claims |
-| 401 | `token_invalidated` | the same, worded differently by ChatGPT |
-| 400 | `invalid_grant` | the refresh token is not accepted |
-| 400 | `refresh_token_reused` | it was already spent |
-
-A JWT's `exp` is a claim, not proof. A token the clock still calls valid gets a
-401 once its session is superseded.
-
-**An account's plan change revokes it too — observed once, not proven.**
-Established 2026-09-02. A saved codex profile stopped working with no login on
-this machine. The usage endpoint answered `401 token_invalidated`, and the
-forced refresh was refused. The dead snapshot's `id_token` carried
-`chatgpt_plan_type: team`. A fresh login on the same account carried
-`self_serve_business_prolite`, so the account had been upgraded between the two.
-What is established: the grant died, and the plan string changed across it. What
-is not: that the upgrade is what killed it. Check the snapshot's plan string
-against the live one before hunting anywhere else.
-
-**Starting a new Codex CLI login revokes the existing grant.**
-Re-established on Codex 0.162.0, 2026-10-09. Official source
+Established on Codex 0.162.0, 2026-10-09. Official source
 `codex-rs/cli/src/login.rs` calls `clear_existing_auth_before_login`, which calls
 `logout_with_revoke`, for both browser and device-code sign-in. A real-binary,
 local-only test with fictitious tokens proved that `codex login --device-auth`
 sends a revocation request for the auth file in its home before starting login.
-The earlier installation-ID explanation does not establish this version's
-behavior; do not rely on it to collect several logins in the shared home.
 
 Account Hub now starts official sign-in in a fresh temporary credential folder
 with no auth file to revoke. Only the result is stored under the explicit local
@@ -75,12 +43,6 @@ revocation request and leaves the working shared auth file unchanged.
   It also identifies `codex-login.log` as the log for direct CLI sign-in. It does
   not itself describe the CLI's pre-login revocation; that was established from
   the official 0.162.0 source and the local-only native test above.
-- The shared home's login log records device-code sign-in starts at 22:55:09,
-  22:59:42 and several times between 23:00 and 23:02 UTC. The user explicitly
-  confirmed using `codex login` in the terminal to collect/reauthenticate the
-  registrations. Together with the native test, this establishes a revocation
-  mechanism present in the user's actual workflow. It does not identify which
-  grant each historical request revoked; no provider audit was performed.
 - The official [accounts and sessions guidance](https://developers.openai.com/siwc/token-sharing-open-source/profiles-and-sessions)
   says to retain the latest replacement tokens and serialize refreshes for the
   same session. Its [recovery guidance](https://developers.openai.com/siwc/token-sharing-open-source/errors-and-recovery)
@@ -90,25 +52,44 @@ revocation request and leaves the working shared auth file unchanged.
   client IDs, token endpoint or lifetimes for the Codex CLI's token format.
 - A usage-cache refresh is not a new sign-in, and deleting a usage cache cannot
   restore a grant revoked on the server. Recover affected UUIDs with the
-  plugin's isolated `a` action, add new registrations with `c`, and apply a saved
-  registration with Enter. Avoid sequential direct sign-ins in the shared home
-  when collecting accounts for later switching.
+  plugin's isolated sign-in action, and apply a saved registration with Enter.
+  Add new registrations with the provider chooser rather than sequential
+  direct sign-ins in the shared home when collecting accounts for later switching.
+
+## Rejection handling in the implementation
+
+The following table describes `proven_payload` and `_refresh_refused` in
+`switcher.py`. It is a local recovery policy, not a guarantee about every
+provider's error vocabulary:
+
+| response | handling |
+|---|---|
+| First usage HTTP 401 | Force token renewal, then retry the usage read once |
+| HTTP 401 during renewal or after the retry | Refuse the switch before changing the active account |
+| Renewal HTTP 400 with `invalid_grant`, `refresh_token_reused`, `refresh_token_invalidated`, or `refresh_token_expired` | Refuse the saved login |
+| HTTP 429 | Record the provider cooldown; do not classify the login as revoked |
+| Network failure or other unrecognized response | Do not infer revocation; retain the separate runtime checks |
+
+Known error codes provide bounded explanations; raw provider messages and
+credentials are never printed. A JWT expiry and an account's plan string cannot
+establish whether its grant remains usable, or why a provider rejected it.
 
 # What Didn't Work
 
-- Trusting the token's `exp`. Both providers hand out tokens that outlive their
-  session, so the clock cannot tell a live login from a dead one.
+- Trusting the token's `exp`. A future expiry cannot prove that the provider
+  still accepts the grant.
 - Reading the credential store back after writing it. That catches a store that
   refused the write. It cannot catch a credential the provider has retired.
-- Treating any 401 or 400 as proof. A timeout, a 429 or no network prove nothing
-  either way, and refusing a switch on those would block a working account.
+- Treating all HTTP failures as revocation. Temporary failures do not establish
+  an unusable grant, and the first usage 401 still has a renewal recovery path.
 
 # Solution
 
 Ask the provider before overwriting a working login, while it is still in place.
 `proven_payload` renews the target profile, reads the usage endpoint, and on a
 401 renews past the clock and asks once more. It refuses the switch only on a
-definitive answer from the table above. `verify_switch = false` turns it off.
+refusal listed in the table above. `verify_switch = false` turns off this
+provider check, not Codex's compatibility and daemon reload checks.
 
 Renewing rotates the tokens, so the check hands back the payload to install and
 `switch()` writes *that* one to the profile. Writing the old one back would park
@@ -116,27 +97,28 @@ a spent pair over a live one — the failure this exists to prevent.
 
 # Why This Works
 
-The provider is the only authority on whether a login works. Everything local —
-the file parsing, the identity matching, the expiry claim — describes the
-snapshot, not the session behind it. Asking costs one HTTP round trip per switch
-and, when the target's access token is clock-expired, one refresh rotation.
+The provider decides whether it accepts a login. Parsing, identity matching and
+expiry checks describe the snapshot, not its server-side grant. A transient
+failure is not a successful verification. Codex switching additionally verifies
+the reloaded daemon's adopted account, as described in the
+[reload investigation](codex-machine-account-reload.md).
 
 # Prevention
 
 - Never treat a parseable snapshot as a working login.
-- Never treat a network failure as a dead account. Only the words in the table.
+- Never treat a network failure as a dead account. Follow the response handling
+  in the table and keep it aligned with `proven_payload` and `_refresh_refused`.
 - Persist a renewal's reply before using it: from the moment the endpoint
   answers, the old refresh token is dead and the reply is the only usable pair
   that account has. `renew_profile` stages it to disk first for that reason.
 - Refresh a profile's snapshot as you park it, so a switch away does not leave a
   copy that can no longer renew.
-- For Codex CLI 0.162.0, collect new registrations using the plugin's `c` sign-in
-  action, and reauthenticate existing UUIDs with `a`. Calling `codex login` in
-  the shared home revokes its existing OAuth login before sign-in.
-- Expect an upgraded account to look exactly like a revoked one. The snapshot
-  still names the old plan, and only a fresh login carries the new one.
+- For Codex CLI 0.162.0, collect new registrations using the provider chooser,
+  and reauthenticate existing UUIDs with the picker sign-in action. Calling
+  `codex login` in the shared home revokes its existing OAuth login before sign-in.
+- Do not attribute revocation to a plan change without provider evidence.
 
-Covered by `test_switcher.py`: a retired profile is refused with the live store
+Covered by `tests/check_switcher.py`: a retired profile is refused with the live store
 untouched and nothing written, a spent refresh token is refused, and being
 offline or rate limited both switch through.
 
@@ -153,13 +135,13 @@ offline or rate limited both switch through.
   duplicate registration with `save`.
 - Multiple registrations with the same display name now show UTC save times.
   This makes a fresh registration distinguishable without displaying secret data.
-- No real account renewal, sign-in or authenticated network probe was performed
-  during this investigation. Current/saved session differences were established
-  by local comparisons only; revocation of a particular user's grant still
-  requires provider evidence or the user completing an official reauthentication.
+- These regressions use fictitious credentials. They do not identify the cause
+  of any real account's refusal; that requires provider evidence or the user
+  completing an official reauthentication. Real Claude authentication remains
+  unvalidated, as documented in the [guide](../../guide.md#claude-code-beta).
 
 `python3 -B test_switcher.py` includes registration/renewal regressions.
 `ACCOUNT_HUB_TEST_REAL_CODEX=1 python3 -B -m unittest
- test_codex_login.RealCodexLogin.test_native_login_revokes_existing_store_but_plugin_login_preserves_it`
+ tests.test_codex_login.RealCodexLogin.test_native_login_revokes_existing_store_but_plugin_login_preserves_it`
 exercises the official CLI with dummy credentials, a local revocation fixture
 and blocked external connections.

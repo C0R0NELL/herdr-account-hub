@@ -23,7 +23,7 @@ class ClaudeLogin(unittest.TestCase):
             "CLAUDE_CODE_OAUTH_TOKEN": "fake-existing-oauth-token",
         })
         self.env.start()
-        spec = importlib.util.spec_from_file_location("claude_login_hub", Path(__file__).with_name("switcher.py"))
+        spec = importlib.util.spec_from_file_location("claude_login_hub", Path(__file__).resolve().parents[1] / "switcher.py")
         self.S = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(self.S)
         self.S.IS_MAC = False
@@ -83,6 +83,14 @@ class ClaudeLogin(unittest.TestCase):
         profiles = self.S.list_profiles("claude")
         self.assertEqual(len(profiles), 3)
         self.assertEqual(len({p["id"] for p in profiles}), 3)
+
+    def test_add_new_skips_an_email_already_saved(self):
+        self.new = self.payload("person-one", "new-grant")
+        with patch.object(self.S.subprocess, "run", side_effect=self.official_login):
+            message = self.S.login_claude(label="Repeated")
+        self.assertIn("already saved", message)
+        self.assertEqual(self.S.list_profiles("claude"), [self.profile])
+        self.assertEqual(self.S.BACKENDS["claude"].read_live(), self.current)
 
     def test_timeout_cancel_and_failed_cli_do_not_register_partial_credentials(self):
         for failure in (subprocess.TimeoutExpired(["claude", "auth", "login"], 900), KeyboardInterrupt(), None):

@@ -12,7 +12,7 @@ import unittest
 import uuid
 from unittest.mock import patch
 
-from test_account_records import login
+from tests.test_account_records import login
 
 
 class MachineSwitch(unittest.TestCase):
@@ -29,7 +29,7 @@ class MachineSwitch(unittest.TestCase):
             "ACCOUNT_HUB_CONFIG_DIR": self.temp.name,
         })
         self.env.start()
-        spec = importlib.util.spec_from_file_location("machine_hub", Path(__file__).with_name("switcher.py"))
+        spec = importlib.util.spec_from_file_location("machine_hub", Path(__file__).resolve().parents[1] / "switcher.py")
         self.S = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(self.S)
         S = self.S
@@ -254,6 +254,7 @@ class MachineSwitch(unittest.TestCase):
             def erase(self): pass
             def refresh(self): pass
             def touchwin(self): pass
+            def clearok(self, *args): pass
             def box(self): pass
             def addnstr(self, y, x, text, count, *a): texts.append(text[:count])
             def getch(self): return next(keys)
@@ -266,11 +267,13 @@ class MachineSwitch(unittest.TestCase):
             curs_set=lambda *a: None, has_colors=lambda: False,
             def_prog_mode=lambda: None, endwin=lambda: None, reset_prog_mode=lambda: None,
             wrapper=lambda run: run(Screen()), newwin=newwin,
-            KEY_DOWN=258, KEY_UP=259, KEY_ENTER=343,
+            KEY_DOWN=258, KEY_UP=259, KEY_ENTER=343, KEY_MOUSE=409,
             A_BOLD=1, A_DIM=2, A_UNDERLINE=4, A_REVERSE=8, A_NORMAL=0)
         self.S.usage_rows = lambda *a, **k: []
         with patch.object(self.S.BACKENDS["claude"], "read_live", return_value=None), \
                 patch.object(self.S.BACKENDS["claude"], "present", return_value=False), \
+                patch.object(self.S, "_sync_picker_size", return_value=False), \
+                patch.object(self.S, "_emit_donate_link"), \
                 patch.dict("sys.modules", {"curses": curses}):
             self.S.cmd_ui([])
         return texts, coordinates

@@ -1,9 +1,14 @@
 id = "c0r0nell.account-hub"
 name = "Account Hub"
-version = "0.2.0"
+version = "0.3.0"
 min_herdr_version = "0.8.0"
-description = "Manage independent account profiles. Switch the Codex account for this machine and reload existing chats while preserving history and titles."
+description = "Codex and Claude Code account picker with usage tracking and Codex resets. Codex reloads existing chats while preserving history; Claude is beta."
 platforms = ["macos", "linux"]
+
+# Prepare durable storage before Herdr replaces an older managed checkout.
+# Standard-library migration only: no compilation, login, or provider requests.
+[[build]]
+command = ["python3", "switcher.py", "storage-migrate"]
 
 # The picker manages profiles and confirms machine-wide Codex account changes.
 [[actions]]
@@ -20,7 +25,7 @@ title = "Account Hub: switch to next account"
 contexts = ["global", "pane"]
 command = ["python3", "switcher.py", "next"]
 
-# Snapshot whatever is logged in right now into a new profile.
+# Save the current login when its email is not already registered.
 [[actions]]
 id = "save"
 title = "Account Hub: save current login as a profile"

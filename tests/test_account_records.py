@@ -33,7 +33,7 @@ class AccountRecords(unittest.TestCase):
         with patch.dict(os.environ, {"ACCOUNT_HUB_STATE_DIR": self.temp.name,
                                      "ACCOUNT_HUB_CONFIG_DIR": self.temp.name}):
             spec = importlib.util.spec_from_file_location(
-                "isolated_switcher", Path(__file__).with_name("switcher.py"))
+                "isolated_switcher", Path(__file__).resolve().parents[1] / "switcher.py")
             self.S = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(self.S)
         S = self.S
@@ -171,6 +171,47 @@ class AccountRecords(unittest.TestCase):
         self.assertEqual(first["payload"], second["payload"])
         self.assertEqual(self.S.active_profile("codex")["id"], second["id"])
 
+    def test_saved_account_is_recognized_by_normalized_email(self):
+        first = self.register(login("Person", "saved", "old"))
+        self.backend.store = login("person", "fresh", "new")
+        self.backend.store["auth"]["tokens"]["account_id"] = "different-workspace"
+        before = self.S.list_profiles("codex")
+        self.assertEqual(self.S.save_live("codex", "Duplicate"), "Account already saved")
+        self.assertEqual(self.S.list_profiles("codex"), before)
+        self.assertEqual(self.S.active_profile("codex")["id"], first["id"])
+        self.assertFalse(self.S.sync_live_profile("codex"))
+
+    def test_live_email_is_marked_without_a_persisted_selection(self):
+        profile = self.register()
+        Path(self.S.SELECTION).unlink()
+        self.backend.store = login(credential="fresh", session="new-session")
+        self.assertEqual(self.S.active_profile("codex")["id"], profile["id"])
+        self.assertFalse(self.S.sync_live_profile("codex"))
+        self.assertEqual(self.S.get_profile("codex", profile["id"]), profile)
+        self.assertEqual(self.S._selection(), {})
+
+    def test_stale_selection_and_automatic_copy_do_not_hide_the_live_email(self):
+        original = self.register(login("one"), "Original")
+        self.register(login("two", "other", "other"), "Other")
+        duplicate = self.S.make_profile("codex", "autosaved-one", original["payload"])
+        self.S.write_profile(duplicate)
+        self.backend.store = original["payload"]
+        rows = self.S.usage_rows(["codex"], refresh=False)
+        self.assertEqual([r["id"] for r in rows if r["active"]], [original["id"]])
+        self.assertFalse(self.S.sync_live_profile("codex"))
+
+    def test_switch_does_not_autosave_an_email_already_registered(self):
+        original = self.register(login("one"), "Original")
+        target = self.register(login("two", "other", "other"), "Other")
+        live = login("one", "fresh", "fresh-session")
+        self.backend.store = live
+        self.S.switch("codex", target["id"])
+        self.assertEqual(len(self.S.list_profiles("codex")), 2)
+        self.assertEqual(self.S.get_profile("codex", original["id"]), original)
+        self.assertEqual(self.backend.store, target["payload"])
+        backups = [json.loads(p.read_text()) for p in Path(self.S.BACKUP_DIR).glob('*.json')]
+        self.assertIn(live, backups)
+
     def test_selection_is_persisted_by_uuid_and_only_one_record_is_active(self):
         first = self.register()
         second = self.register()
@@ -230,7 +271,8 @@ class AccountRecords(unittest.TestCase):
         Path(self.S.SELECTION).unlink()
         self.backend.store = login(credential="rotated")
         self.assertFalse(self.S.sync_live_profile("codex"))
-        self.assertIsNone(self.S.active_profile("codex"))
+        self.assertEqual(self.S.active_profile("codex")["id"], profile["id"])
+        self.assertIsNone(self.S._selected_login_profile("codex"))
         self.assertEqual(self.S.get_profile("codex", profile["id"])["payload"], profile["payload"])
 
     def test_reauthentication_only_replaces_explicit_uuid(self):
@@ -287,7 +329,8 @@ class AccountRecords(unittest.TestCase):
         first = self.register()
         second = self.register()
         self.assertTrue(self.S.delete_profile("codex", second["id"]))
-        self.assertIsNone(self.S.active_profile("codex"))
+        self.assertEqual(self.S.active_profile("codex")["id"], first["id"])
+        self.assertIsNone(self.S._selected_login_profile("codex"))
         self.assertEqual(self.S.get_profile("codex", first["id"]), first)
         self.assertEqual(self.backend.store, second["payload"])
         self.assertFalse(self.S.delete_profile("codex", "../../auth"))
@@ -343,12 +386,14 @@ class PluginNamespace(unittest.TestCase):
                     "HERDR_PLUGIN_CONFIG_DIR", "ACCOUNT_HUB_STATE_DIR",
                     "ACCOUNT_HUB_CONFIG_DIR"):
             env.pop(key, None)
-        env.update({"HOME": str(home), "CODEX_HOME": str(home / ".codex")})
+        env.update({"HOME": str(home), "CODEX_HOME": str(home / ".codex"),
+                    "XDG_STATE_HOME": str(home / ".local/state"),
+                    "XDG_CONFIG_HOME": str(home / ".config")})
         env.update(overrides or {})
         root = home / "plugin-checkout"
         root.mkdir(exist_ok=True)
         script = root / "switcher.py"
-        shutil.copyfile(Path(__file__).with_name("switcher.py"), script)
+        shutil.copyfile(Path(__file__).resolve().parents[1] / "switcher.py", script)
         with patch.dict(os.environ, env, clear=True):
             spec = importlib.util.spec_from_file_location(
                 "namespaced_switcher", script)
@@ -364,9 +409,9 @@ class PluginNamespace(unittest.TestCase):
             original.write_text(json.dumps({"label": "Original", "payload": login()}))
             before = original.read_bytes()
             plugin = self.load_plugin(home)
-            self.assertEqual(Path(plugin.STATE_DIR), home / "plugin-checkout/.local")
+            self.assertEqual(Path(plugin.STATE_DIR), home / ".local/state/herdr/plugins/c0r0nell.account-hub")
             self.assertEqual(plugin.list_profiles("codex"), [])
-            manifest = tomllib.loads(Path(__file__).with_name("herdr-plugin.toml").read_text())
+            manifest = tomllib.loads((Path(__file__).resolve().parents[1] / "herdr-plugin.toml").read_text())
             self.assertNotEqual(manifest["id"], "rcosteira.account-switch")
             self.assertEqual(plugin.PLUGIN_ID, manifest["id"])
             own = Path(plugin.PROFILES_DIR, "codex", "hub.json")
@@ -386,7 +431,7 @@ class PluginNamespace(unittest.TestCase):
                 "HERDR_PLUGIN_CONFIG_DIR": str(home / "original-config"),
                 "ACCOUNT_SWITCH_NOTIFY": "0", "ACCOUNT_HUB_NOTIFY": "1"})
             self.assertEqual(plugin.list_profiles("codex"), [])
-            self.assertEqual(Path(plugin.CONFIG_DIR), home / "plugin-checkout/.local/config")
+            self.assertEqual(Path(plugin.CONFIG_DIR), home / ".config/herdr/plugins/config/c0r0nell.account-hub")
             self.assertTrue(plugin.NOTIFY)
 
     def test_plugin_specific_overrides_keep_a_separate_profile_store(self):

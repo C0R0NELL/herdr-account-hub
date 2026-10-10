@@ -18,7 +18,7 @@ import uuid
 from unittest.mock import patch
 from datetime import datetime, timezone
 
-from test_account_records import login
+from tests.test_account_records import login
 
 
 class _RuntimeFixture(unittest.TestCase):
@@ -34,7 +34,7 @@ class _RuntimeFixture(unittest.TestCase):
         self.env = patch.dict(os.environ, env)
         self.env.start()
         spec = importlib.util.spec_from_file_location(
-            "runtime_switcher", Path(__file__).with_name("switcher.py"))
+            "runtime_switcher", Path(__file__).resolve().parents[1] / "switcher.py")
         self.S = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(self.S)
         self.S.proven_payload = lambda kind, p: p["payload"]
