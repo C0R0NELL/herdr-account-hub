@@ -139,7 +139,7 @@ provider contracts and may change.
 ## Private files and updates
 
 Credentials and state belong to the plugin ID and stay outside its source
-checkout. With the default Herdr directories, production uses:
+checkout. With the default Herdr directories, Account Hub uses:
 
 ```text
 ~/.local/state/herdr/plugins/c0r0nell.account-hub/profiles/<kind>/<uuid>.json
@@ -148,8 +148,8 @@ checkout. With the default Herdr directories, production uses:
 ```
 
 Caches, backups, token sidecars, and reset receipts share that state directory.
-Development uses the same layout with `c0r0nell.dev-account-hub`; the two stores
-remain separate. Paths respect `XDG_STATE_HOME` and `XDG_CONFIG_HOME`, or the
+Local links and GitHub installations use the same official identity and storage
+on a machine. Paths respect `XDG_STATE_HOME` and `XDG_CONFIG_HOME`, or the
 state/config directories Herdr injects for the matching plugin ID.
 `ACCOUNT_HUB_STATE_DIR` and `ACCOUNT_HUB_CONFIG_DIR` explicitly override them;
 keep overrides outside source checkouts too.
@@ -166,7 +166,7 @@ instead of copying a store while older processes may still use it.
 Managed updates, uninstallation, and reinstallation leave the durable data in
 place. Deleting these state/config directories explicitly still deletes it.
 Private directories use `0700`; private files use `0600`. The tracked `.gitignore`
-excludes the compatibility path and generated development manifest, but cannot
+excludes the compatibility path and additional local manifests, but cannot
 protect secrets already committed. Applying an account still changes the shared
 live CLI store, independently of where Account Hub keeps its saved copies.
 
@@ -186,20 +186,21 @@ configuration key. Herdr actions inherit the server's environment. Settings are
 loaded when the Python process starts; reopen the picker after editing them.
 The supported options and defaults are defined in [switcher.py](../switcher.py).
 
-## Development and checks
+## Local editing and checks
 
-Keep your development checkout wherever you prefer. From its root:
+Keep your editable checkout wherever you prefer. From its root:
 
 ```sh
-python3 scripts/link-dev.py
+herdr plugin link "$PWD/herdr-plugin.toml" --enabled
 python3 tests/check_switcher.py
 ```
 
-The [helper](../scripts/link-dev.py) generates the ignored development manifest
-and links this checkout as `c0r0nell.dev-account-hub`, named **dev-account-hub**.
-The official manifest keeps `c0r0nell.account-hub`, named **Account Hub**.
-Reopen the picker to load Python edits; rerun the helper after manifest changes.
-A separate GitHub installation uses its own code and durable production store.
+The link uses the official manifest, ID `c0r0nell.account-hub`, and name
+**Account Hub**. If this ID already has a managed GitHub installation on the
+machine, uninstall that registration first; its durable accounts remain in place.
+Reopen the picker to load Python edits; relink after manifest changes. Use a
+normal GitHub installation on another machine to verify released updates.
+Linked checkouts read edited files directly and are excluded from update checks.
 
 Checks live in [tests/](../tests/) and use temporary state and fictitious logins.
 The check script runs the unit, terminal, and isolated release regressions. With Herdr installed,

@@ -7,7 +7,7 @@ __pycache__/
 
 # Local credentials and account state must never be committed.
 /.local
-/herdr-plugin.dev.toml
+/herdr-plugin.*.toml
 .env
 .env.*
 !.env.example

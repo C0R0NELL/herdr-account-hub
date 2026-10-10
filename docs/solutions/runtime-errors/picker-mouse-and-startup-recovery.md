@@ -9,7 +9,7 @@ tags: [usage, startup, mouse, confirmation, cache]
 # Evidence and scope
 
 The user reported error markers on picker entry that cleared after manual
-refresh. Read-only inspection of the development usage cache after refresh
+refresh. Read-only inspection of the local usage cache after refresh
 found no retained reporting or saved-login errors, so it did not establish
 which actual provider error caused the initial markers.
 
@@ -93,7 +93,7 @@ also specify that popup input takes precedence over shell controls. This is host
 placement behavior, separate from the picker's curses mouse mask.
 
 The popup attempt was reverted in both `cmd_open` and the manifest, and the
-development registration was linked back to `overlay`. Keep that placement when
+local registration was linked back to `overlay`. Keep that placement when
 normal Herdr navigation must remain available. A direct foreground `ui` command
 in an idle terminal is a different launch path; plugin actions run detached and
 cannot simply take over the foreground terminal.
@@ -106,7 +106,7 @@ not establish that Herdr's tabs, sidebar, or prefix shortcuts remain usable.
 # Picker closes during account-store contention
 
 Also on 2026-10-10, direct `python3 switcher.py ui` reported a five-second lock
-timeout. At inspection, both production and development locks were available and
+timeout. At inspection, both inspected account-operation locks were available and
 no picker process was running, so the original holder could not be identified.
 Usage refresh, token renewal, and switching share the same lock; the timeout
 message alone does not establish that a switch was stuck.

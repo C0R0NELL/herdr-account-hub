@@ -1,6 +1,6 @@
 id = "c0r0nell.account-hub"
 name = "Account Hub"
-version = "0.3.1"
+version = "0.3.2"
 min_herdr_version = "0.8.0"
 description = "Codex and Claude Code account picker with usage tracking and Codex resets. Codex reloads existing chats while preserving history; Claude is beta."
 platforms = ["macos", "linux"]

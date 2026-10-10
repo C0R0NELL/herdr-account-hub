@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -14,6 +15,7 @@ from tests.test_storage import Storage, OFFICIAL
 
 fixture = Storage()
 fixture.setUp()
+server = None
 try:
     env = {k: v for k, v in fixture.env.items() if not k.startswith('HERDR_')}
     env.update(XDG_DATA_HOME=str(fixture.base / 'data'),
@@ -88,6 +90,46 @@ try:
     assert (state / ('profiles/codex/' + profile_id + '.json')).exists()
     install()
     assert (state / ('profiles/codex/' + profile_id + '.json')).exists()
-    print('PASS: real Herdr managed conflict rejection, legacy upgrade, next upgrade, uninstall and reinstall; all fictitious records unchanged')
+    # The same official identity can use a local checkout without copying state.
+    run([herdr, '--session', session, 'plugin', 'uninstall', OFFICIAL])
+    run([herdr, '--session', session, 'plugin', 'link',
+         str(fixture.root / 'herdr-plugin.toml'), '--enabled'])
+    linked = info()
+    if isinstance(linked, dict):
+        linked = linked.get('result', linked)
+        if isinstance(linked, dict):
+            linked = linked.get('plugins', linked)
+    local = next(item for item in linked if item['plugin_id'] == OFFICIAL)
+    assert local['source']['kind'] == 'local', local
+    assert Path(local['manifest_path']) == fixture.root / 'herdr-plugin.toml'
+    for relative, value in files.items():
+        assert json.loads((state / relative).read_text()) == value, relative
+    # Unlike offline install/list, unlink uses the running server's registry API.
+    # Start only a disposable, isolated session; never touch the user's server.
+    server = subprocess.Popen([herdr, '--session', session, 'server'], env=env,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    deadline = time.monotonic() + 10
+    while True:
+        ready = subprocess.run([herdr, '--session', session, 'status'], env=env,
+                               capture_output=True, text=True, timeout=5)
+        if ready.returncode == 0:
+            break
+        if server.poll() is not None or time.monotonic() >= deadline:
+            raise RuntimeError('Isolated Herdr test server did not become ready: ' + ready.stderr)
+        time.sleep(0.05)
+    run([herdr, '--session', session, 'plugin', 'unlink', OFFICIAL])
+    assert fixture.root.is_dir(), 'unlink removed the editable checkout'
+    install()
+    for relative, value in files.items():
+        assert json.loads((state / relative).read_text()) == value, relative
+    print('PASS: real Herdr managed upgrades, local link/unlink and reinstall; all fictitious records unchanged')
 finally:
+    if server is not None:
+        subprocess.run([herdr, '--session', session, 'server', 'stop'], env=env,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+        try:
+            server.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            server.terminate()
+            server.wait(timeout=5)
     fixture.tearDown()

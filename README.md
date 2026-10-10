@@ -22,7 +22,7 @@ Open Account Hub from Herdr's plugin manager. Save your current login or add
 another account through the picker, then select the account you want to use.
 Available controls are shown in the interface.
 
-Configuration, private storage, and development instructions are in the
+Configuration, private storage, and local editing instructions are in the
 [guide](docs/guide.md). Authentication and reload investigations are kept in
 [docs/solutions/](docs/solutions/).
 

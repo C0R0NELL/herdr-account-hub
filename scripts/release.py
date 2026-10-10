@@ -105,7 +105,7 @@ def check_files(ref):
     for filename in filenames.rstrip("\0").split("\0"):
         parts = Path(filename).parts
         if (parts[0] in {".local", ".codex", ".claude", "profiles", "backups", "rotated"}
-                or filename == "herdr-plugin.dev.toml"
+                or re.fullmatch(r"herdr-plugin\..+\.toml", parts[-1])
                 or re.fullmatch(r"(?:auth|credentials|\.credentials|\.claude)\.json(?:\..*)?", parts[-1])
                 or parts[-1] == ".env" or parts[-1].startswith(".env.") and parts[-1] != ".env.example"):
             raise ReleaseError("Private/generated file is tracked: " + filename)

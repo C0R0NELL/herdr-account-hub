@@ -107,14 +107,15 @@ to apply the new message convention.
   not require a version bump.
 - Record user-facing changes in `CHANGELOG.md` when preparing a release. Its
   version, the official manifest, and any `vX.Y.Z` release tag must agree.
-- Keep the official ID/name stable. Generate the development ID/name through
-  `scripts/link-dev.py`; never commit the generated development manifest.
+- Keep the official ID/name stable. Local editing uses the same official
+  manifest and plugin ID: `herdr plugin link "$PWD/herdr-plugin.toml" --enabled`.
+  Install from GitHub on a separate machine to verify the normal update flow.
 - Run `python3 tests/check_switcher.py` before releasing. Keep credentials, `.local/`,
   and other private state excluded from Git.
 - Verify managed-install upgrades with temporary, fictitious accounts before
   public release. Preserve registration UUIDs, credentials, selection, settings,
   and pending reset operations. State and configuration must remain outside all
-  source checkouts, scoped to the stable official/development plugin ID. Preserve
+  source checkouts, scoped to the stable official plugin ID. Preserve
   the install preparation hook that imports an older checkout's `.local/`
   before cleanup. Git ignore rules do not preserve files during installation.
   Run `python3 tests/check_managed_upgrade.py` with an installed Herdr for the
@@ -123,7 +124,7 @@ to apply the new message convention.
 Update availability is based on the upstream commit for the installed Git ref,
 not only the manifest version. The Plugin Manager reads the remote manifest to
 display the target version when available. Users explicitly apply updates;
-locally linked development checkouts are excluded from update checks. Publishing
+locally linked checkouts are excluded from update checks. Publishing
 a commit or tag does not automatically update an installed plugin.
 
 Recheck distribution behavior against the [Herdr plugin documentation](https://herdr.dev/docs/plugins/),

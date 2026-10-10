@@ -3,7 +3,7 @@
 The source repository is [C0R0NELL/herdr-account-hub](https://github.com/C0R0NELL/herdr-account-hub).
 Install it with `herdr plugin install C0R0NELL/herdr-account-hub`. The repository
 name does not change the official ID `c0r0nell.account-hub`, the display name
-**Account Hub**, or the development ID `c0r0nell.dev-account-hub`.
+**Account Hub**. Local links use the same official manifest and identity.
 
 ## Marketplace requirements
 
@@ -25,16 +25,16 @@ Sources: [Marketplace](https://herdr.dev/docs/marketplace/) and
 ## Release preparation
 
 - Retest durable storage for each release that changes installation or storage.
-  Official and development IDs use separate state/config directories outside
-  checkouts. The install hook imports legacy `.local/` before old code is removed.
+  The official ID owns state/config directories outside source checkouts.
+  The install hook imports legacy `.local/` before old code is removed.
   `python3 tests/check_managed_upgrade.py` validates fictitious accounts through
   the real Herdr installer; conflicts fail without replacing credentials.
   See the [migration evidence](solutions/runtime-errors/durable-plugin-storage.md)
   and [official storage guidance](https://herdr.dev/docs/plugins/#commands-and-environment).
 - Prepare the actual release diff under [AGENTS.md](../AGENTS.md): propose and
   agree on a version, update the manifest and `CHANGELOG.md`, run the full
-  checks, review Git exclusions, and then commit and push. The development
-  manifest and private data must remain excluded.
+  checks, review Git exclusions, and then commit and push. Additional local
+  manifests and private data must remain excluded.
 - Keep the repository public and its `herdr-plugin` topic present for marketplace
   discovery. Renaming the repository by itself does not publish a release.
 
@@ -97,4 +97,4 @@ Herdr binary supports it; older binaries can reinstall from the same GitHub
 source instead. The [Plugin Manager](https://github.com/speardragon/herdr-plugin-manager)
 compares the installed commit to the requested upstream ref and displays the
 remote manifest version when available. Users apply updates explicitly;
-locally linked development checkouts are excluded from those update checks.
+locally linked checkouts are excluded from those update checks.

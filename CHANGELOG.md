@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.3.2 - 2026-10-10
+
+### Maintenance
+
+- Use the official Account Hub manifest and identity for local editing, removing
+  the separate generated manifest and linking helper. The official plugin ID,
+  display name, durable account storage, and managed update flow remain stable.
+- Extend isolated Herdr integration checks to cover local linking, unlinking,
+  and returning to a managed installation while preserving account records.
+- Exclude additional local manifests from Git and reject them in release checks.
+- Align contributor, storage, and publishing documentation with the single
+  official manifest workflow and record the verified local storage transition.
+- Include the repository's existing Dependabot configuration template.
+
 ## 0.3.1 - 2026-10-10
 
 ### Fixed
@@ -31,7 +45,7 @@
   Provider options can also be selected by mouse. Keyboard navigation remains
   available, and clicks outside action labels do not confirm or cancel dialogs.
 - Pink terminal hyperlink to GitHub Sponsors in the picker footer.
-- Durable, separate development and production stores keyed to the plugin ID.
+- Durable storage keyed to the stable plugin ID.
   Installation and first launch migrate legacy private files before source
   checkout cleanup, preserving registrations, credentials, settings, selection,
   caches, backups, and pending reset operations.
@@ -58,6 +72,6 @@
 ### Maintenance
 
 - Rename the source repository to `C0R0NELL/herdr-account-hub` while retaining the
-  official and development manifest IDs.
+  official manifest ID.
 - Shorten the README, add a usage guide and publishing notes, and organize checks
   in `tests/`, including native-terminal and managed-upgrade regressions.

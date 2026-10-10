@@ -1,4 +1,4 @@
-"""Durable dev/prod stores and upgrade migration with fictitious data only."""
+"""Durable official storage and upgrade migration with fictitious data only."""
 import importlib.util
 import errno
 import fcntl
@@ -17,7 +17,6 @@ from tests.test_account_records import login
 
 ROOT = Path(__file__).resolve().parents[1]
 OFFICIAL = "c0r0nell.account-hub"
-DEVELOPMENT = "c0r0nell.dev-account-hub"
 
 
 class Storage(unittest.TestCase):
@@ -90,18 +89,18 @@ class Storage(unittest.TestCase):
         self.assertEqual(Path(S.STATE_DIR), state)
         self.assertEqual(Path(S.CONFIG_DIR), config)
 
-    def test_development_and_production_are_separate_and_stable_across_checkouts(self):
-        dev_manifest = (self.root / "herdr-plugin.toml").read_text().replace(
-            'id = "' + OFFICIAL + '"', 'id = "' + DEVELOPMENT + '"', 1)
-        (self.root / "herdr-plugin.dev.toml").write_text(dev_manifest)
-        dev = self.load()
-        prod = self.load(root=self.checkout("production"))
-        self.assertEqual(dev.PLUGIN_ID, DEVELOPMENT)
-        self.assertNotEqual(dev.STATE_DIR, prod.STATE_DIR)
+    def test_local_and_managed_checkouts_share_the_stable_official_identity(self):
+        extra_manifest = (self.root / "herdr-plugin.toml").read_text().replace(
+            'id = "' + OFFICIAL + '"', 'id = "fixture.other-account-picker"', 1)
+        (self.root / "herdr-plugin.personal.toml").write_text(extra_manifest)
+        local = self.load()
+        managed = self.load(root=self.checkout("managed"))
+        self.assertEqual(local.PLUGIN_ID, OFFICIAL)
+        self.assertEqual(local.STATE_DIR, managed.STATE_DIR)
+        self.assertEqual(local.CONFIG_DIR, managed.CONFIG_DIR)
         shutil.rmtree(self.root)
-        replacement = self.checkout("new-development")
-        (replacement / "herdr-plugin.dev.toml").write_text(dev_manifest)
-        self.assertEqual(self.load(root=replacement).STATE_DIR, dev.STATE_DIR)
+        replacement = self.checkout("new-local-checkout")
+        self.assertEqual(self.load(root=replacement).STATE_DIR, local.STATE_DIR)
 
     def test_legacy_migration_preserves_every_record_and_survives_checkout_replacement(self):
         source, profile_id, files = self.legacy()
@@ -242,7 +241,7 @@ class Storage(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("outside the source checkout", result.stderr)
 
-    def test_legacy_dev_pointer_is_preserved_without_traversing_the_source_code(self):
+    def test_legacy_checkout_pointer_is_preserved_without_traversing_the_source_code(self):
         source, _, _ = self.legacy()
         (source / "current").symlink_to(self.root, target_is_directory=True)
         script_mode = (self.root / "switcher.py").stat().st_mode

@@ -82,7 +82,7 @@ and cannot authorize silent credential replacement.
 Fictitious regressions cover stale/missing selection, normalized email across
 changed workspace metadata, provider separation, Add new duplicate skips,
 no automatic copy during switching, and unchanged credentials during display.
-The redundant development `autosaved-` file was moved to the ignored, private
+The redundant `autosaved-` file was moved to the ignored, private
 `.local/backups/duplicate-profiles/` after checking identical credentials and no
 pending reset. The original UUID was retained, the live auth file remained
 byte-for-byte unchanged, and five Codex registrations with one current marker

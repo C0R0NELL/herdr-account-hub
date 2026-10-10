@@ -11,9 +11,9 @@ What a profile holds (per agent kind):
           identity block out of ~/.claude.json
   codex   ~/.codex/auth.json
 
-Profiles live in this plugin ID's durable Herdr state directory, 0600 under
-a 0700 directory. Development and production have separate stores outside the
-source checkout. Credentials are password-equivalent secrets and stay local.
+Profiles live in the official plugin ID's durable Herdr state directory, 0600
+under a 0700 directory outside all source checkouts. Credentials are
+password-equivalent secrets and stay local.
 
 Subcommands:
   ui       the overlay picker (plugin pane entrypoint)
@@ -68,12 +68,9 @@ def _manifest_id(filename, default=None):
 
 
 OFFICIAL_ID = _manifest_id("herdr-plugin.toml", "c0r0nell.account-hub")
-namespace, _, slug = OFFICIAL_ID.rpartition(".")
-DEVELOPMENT_ID = namespace + ".dev-" + slug
 _HOST_ID = os.environ.get("HERDR_PLUGIN_ID")
-_OWN_HOST = _HOST_ID in (OFFICIAL_ID, DEVELOPMENT_ID)
+_OWN_HOST = _HOST_ID == OFFICIAL_ID
 PLUGIN_ID = (_HOST_ID if _OWN_HOST or os.environ.get("ACCOUNT_HUB_STATE_DIR") and _HOST_ID
-             else DEVELOPMENT_ID if _manifest_id("herdr-plugin.dev.toml") == DEVELOPMENT_ID
              else OFFICIAL_ID)
 HERDR_CONFIG_BASE = os.path.join(os.path.expanduser(os.environ.get("XDG_CONFIG_HOME") or "~/.config"), "herdr")
 HERDR_STATE_BASE = os.path.join(os.path.expanduser(os.environ.get("XDG_STATE_HOME") or "~/.local/state"), "herdr")
@@ -440,13 +437,13 @@ def _legacy_storage_roots():
 
 
 def _private_tree(path, checkout):
-    """Keep secrets private without following the legacy dev source pointer."""
+    """Keep secrets private without following the legacy source pointer."""
     for directory, names, files in os.walk(path):
         os.chmod(directory, 0o700)
         for name in names + files:
             item = os.path.join(directory, name)
             if os.path.islink(item):
-                # An earlier local dev setup used .local/current -> checkout.
+                # An earlier local setup used .local/current -> checkout.
                 # Preserve that pointer as a link; never traverse or chmod it.
                 if directory == path and name == "current" and os.path.realpath(item) == checkout:
                     continue
@@ -507,7 +504,7 @@ def _migrate_config(source):
 
 
 def initialize_storage():
-    """Preserve legacy stores before source replacement, for dev and production."""
+    """Preserve legacy stores before any source checkout is replaced."""
     if _inside(STATE_DIR, ROOT) or _inside(CONFIG_DIR, ROOT):
         raise SwitchError("Account storage must be outside the source checkout so updates preserve it")
     _secure_dir(os.path.dirname(STATE_DIR))

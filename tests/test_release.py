@@ -45,7 +45,7 @@ class ReleaseWorkflow(unittest.TestCase):
                 "from pathlib import Path\n"
                 "Path(__file__).resolve().parents[2].joinpath('checks-ran').open('a').write(__file__ + '\\n')\n")
         (self.root / "switcher.py").write_text("# Fictitious plugin\n")
-        (self.root / ".gitignore").write_text(".local/\nherdr-plugin.dev.toml\nauth.json\n")
+        (self.root / ".gitignore").write_text(".local/\nherdr-plugin.*.toml\nauth.json\n")
         self.metadata("0.1.0", "- Initial release.")
         self.git("add", ".")
         self.git("commit", "-m", "chore: initialize fictitious repository")
