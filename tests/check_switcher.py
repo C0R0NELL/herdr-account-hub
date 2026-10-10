@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Checks for account switching, renewal and usage reporting.
 
-Run with `python3 test_switcher.py`. Standard library only, same as the plugin.
+Run with `python3 tests/check_switcher.py`. Standard library only, same as the plugin.
 
 Nothing here touches a real credential store, a real keychain, or the network:
 the state directory is a temporary one, the credential backend is a fake, and
@@ -995,6 +995,9 @@ check("native picker resize and screen recovery regressions", terminal.returncod
 
 resets = subprocess.run([sys.executable, "-B", "-m", "unittest", "tests.test_codex_resets"], cwd=ROOT)
 check("earned Codex reset selection, confirmation and idempotency regressions", resets.returncode == 0)
+
+releases = subprocess.run([sys.executable, "-B", "-m", "unittest", "tests.test_release"], cwd=ROOT)
+check("isolated release workflow regressions", releases.returncode == 0)
 
 shutil.rmtree(STATE, ignore_errors=True)
 print("\n%s — %d of the checks failed"

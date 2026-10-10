@@ -61,7 +61,7 @@ that hint or claim it proves rejection.
 
 # Verification limits
 
-`python3 -B test_switcher.py` includes `tests/test_codex_resets.py` and
+`python3 -B tests/check_switcher.py` includes `tests/test_codex_resets.py` and
 `tests/test_usage_picker.py`. They use fictitious credentials/provider responses:
 earliest expiry, tied choice, unavailable/malformed/capped details, cancellation,
 account isolation in a shared workspace, confirmation expiry, two simultaneous

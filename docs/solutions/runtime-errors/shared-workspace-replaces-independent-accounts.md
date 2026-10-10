@@ -91,7 +91,7 @@ this inspection or cleanup.
 
 # Verification and limits
 
-`python3 test_switcher.py` runs the existing renewal/usage checks plus
+`python3 tests/check_switcher.py` runs the existing renewal/usage checks plus
 `tests/test_account_records.py`. The latter uses temporary files, memory-only
 credential backends and fake JWT claims. It covers distinct people sharing a
 workspace, duplicate registrations, explicit selection and reauthentication,

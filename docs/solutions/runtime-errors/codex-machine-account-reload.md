@@ -79,7 +79,7 @@ Unix WebSocket transport remains experimental as described in the official docs.
 
 # Verification
 
-- `python3 -B test_switcher.py`: core checks, UUID isolation, global transaction
+- `python3 -B tests/check_switcher.py`: core checks, UUID isolation, global transaction
   failures, confirmation/cancellation and transport tests; all credentials fake.
 - `ACCOUNT_HUB_TEST_REAL_CODEX=1 python3 -B -m unittest tests.test_codex_runtime.RealCodexMachine`:
   optional native integration with two chats and three dummy users, no inference.

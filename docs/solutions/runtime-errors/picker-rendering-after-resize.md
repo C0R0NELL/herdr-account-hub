@@ -42,7 +42,7 @@ and provider usage cache are unchanged by this rendering fix.
 credential and HTTP backends. In addition to the two regressions above, it
 checks that outdated hyperlink coordinates produce no text, and that returning
 from a switch retransmits all five account rows after an out-of-band screen
-clear. The root `python3 test_switcher.py` includes these native terminal checks.
+clear. `python3 tests/check_switcher.py` includes these native terminal checks.
 No actual login, switch, provider request, or reset is performed.
 
 The [Python curses documentation](https://docs.python.org/3/library/curses.html)

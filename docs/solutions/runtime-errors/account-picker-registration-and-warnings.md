@@ -65,7 +65,7 @@ remains available. Claude remains beta: no actual Claude account was tested.
 
 ## Verification
 
-`python3 -B test_switcher.py` includes all registration and picker tests:
+`python3 -B tests/check_switcher.py` includes all registration and picker tests:
 
 - Arrow/Enter/Esc provider choice, optional names, confirmation cancellation,
   automatic signup dispatch and return to the picker after failure.

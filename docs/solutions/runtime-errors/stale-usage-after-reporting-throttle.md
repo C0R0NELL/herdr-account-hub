@@ -78,7 +78,7 @@ UUID. Another person in the same workspace cannot supply that account's usage.
 The save prompt appears only for an absent identity and reads
 `(press 's' to save this account)`.
 
-`tests/test_usage_picker.py`, included by `python3 -B test_switcher.py`, reproduces
+`tests/test_usage_picker.py`, included by `python3 -B tests/check_switcher.py`, reproduces
 clipped accounts, expanded-row scrolling, selection drift, stale explicit
 refresh, new registrations, fresh live authentication, and persistent errors.
 It also checks five distinct users with identical labels in one workspace,

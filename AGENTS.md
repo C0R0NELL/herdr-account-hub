@@ -3,8 +3,8 @@
 `switcher.py` is the whole plugin: standard library only, no compilation. Its
 manifest's install preparation hook migrates legacy private storage before
 Herdr removes the old checkout; it never signs in or calls provider APIs. Run the
-checks with `python3 test_switcher.py` — this root entrypoint runs the checks in
-`tests/`. They use a temporary state directory and a fake credential backend,
+checks with `python3 tests/check_switcher.py`. They use a temporary state
+directory and a fake credential backend,
 and never touch a real login.
 
 Solved problems that cost real investigation live in `docs/solutions/`, stamped
@@ -15,6 +15,23 @@ switching, or the credential stores.
 
 Account Hub is intended for public distribution through Herdr. Treat published
 versions as user-facing releases.
+
+### Commit messages
+
+- Write every commit subject and body in English using
+  [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/).
+  Use `<type>(<scope>): <summary>`; the scope is optional. Choose the type and
+  scope from the actual diff: `feat`, `fix`, `docs`, `style`, `refactor`, `perf`,
+  `test`, `build`, `ci`, `chore`, or `revert`. Mark breaking changes with `!`.
+- Describe the resulting behavior in the subject, rather than using only a
+  version number. Follow it with a blank line and concrete bullet notes. For
+  example, `fix(picker): keep accounts visible during lock contention`.
+- For a release commit, write the notes once in `CHANGELOG.md`. The release
+  helper uses that exact version section as the commit body and GitHub Release
+  description. Keep the notes in English; never include private account data.
+  Cover the complete release diff since the preceding published tag, including
+  changes already committed. The helper extracts notes; it does not summarize
+  commit history or verify that every change is documented.
 
 ### Mandatory before every commit to `main`
 
@@ -38,6 +55,43 @@ For documentation-only or test-organization changes with no plugin behavior
 or compatibility change, explicitly recommend keeping the current version and
 explain why. Reviewing versioning is mandatory even when no bump is needed.
 
+### Standard release workflow
+
+Use `scripts/release.py` for release commits and GitHub Releases. The script
+does not infer approval, choose a version, edit the changelog, or stage files.
+The agent must still review the actual diff, propose the correct version, and
+obtain the user's agreement under the rules above. Human review also checks
+the accuracy and English wording of the subject and notes; format validation
+cannot establish either of those.
+
+This is a manually invoked workflow, not a GitHub Actions workflow. A commit or
+pull request does not create a tag or GitHub Release. Publication requires the
+separate, explicitly authorized `publish` command. The release helper requires
+Python 3.11 or newer; publishing also requires GitHub write permission.
+
+1. Update the official manifest and the first `CHANGELOG.md` entry to the
+   approved version. Changelog headings must be `## X.Y.Z - YYYY-MM-DD`, with
+   unique versions and nonempty bullet notes. Keep older entries below it.
+2. Run `python3 scripts/release.py --subject '<type>(<scope>): <summary>'` to
+   preview the selected version, tag, subject, and exact notes. It has no
+   network calls or writes. Review all changes and stage only intended files.
+3. Run `python3 scripts/release.py commit --version X.Y.Z --subject
+   '<type>(<scope>): <summary>'`. Both arguments are required. It checks the
+   staged manifest/changelog, Git exclusions, obvious credential patterns,
+   version progression, and both test commands before committing on `main`.
+   Unstaged/untracked files and changes during checks abort the operation.
+4. Once publication is authorized, run
+   `python3 scripts/release.py publish --version X.Y.Z` on the clean committed
+   tree. It reruns both checks, pushes the exact commit and its tag without
+   force, and creates the GitHub Release using those committed notes. Git and
+   the authenticated GitHub CLI (`gh`) are required. Conflicting tags or
+   existing release metadata are never replaced. Retry the same command after
+   a GitHub failure; an already matching published release is a no-op.
+
+Documentation/test-only maintenance can use a normal Conventional Commit
+without a new changelog version or GitHub Release, after the mandatory version
+review. Never amend published history just to apply the new message convention.
+
 ### Release conventions
 
 - Bump `version` in the official `herdr-plugin.toml` for each release that changes
@@ -50,7 +104,7 @@ explain why. Reviewing versioning is mandatory even when no bump is needed.
   version, the official manifest, and any `vX.Y.Z` release tag must agree.
 - Keep the official ID/name stable. Generate the development ID/name through
   `scripts/link-dev.py`; never commit the generated development manifest.
-- Run `python3 test_switcher.py` before releasing. Keep credentials, `.local/`,
+- Run `python3 tests/check_switcher.py` before releasing. Keep credentials, `.local/`,
   and other private state excluded from Git.
 - Verify managed-install upgrades with temporary, fictitious accounts before
   public release. Preserve registration UUIDs, credentials, selection, settings,

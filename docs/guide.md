@@ -192,7 +192,7 @@ Keep your development checkout wherever you prefer. From its root:
 
 ```sh
 python3 scripts/link-dev.py
-python3 test_switcher.py
+python3 tests/check_switcher.py
 ```
 
 The [helper](../scripts/link-dev.py) generates the ignored development manifest
@@ -202,7 +202,7 @@ Reopen the picker to load Python edits; rerun the helper after manifest changes.
 A separate GitHub installation uses its own code and durable production store.
 
 Checks live in [tests/](../tests/) and use temporary state and fictitious logins.
-The root test script runs the unit and terminal regressions. With Herdr installed,
+The check script runs the unit, terminal, and isolated release regressions. With Herdr installed,
 run `python3 tests/check_managed_upgrade.py` to exercise its real managed installer
 against a temporary local Git repository and fictitious accounts. Investigation notes in
 [solutions/](solutions/) document established behavior and validation limits.

@@ -140,7 +140,7 @@ offline or rate limited both switch through.
   completing an official reauthentication. Real Claude authentication remains
   unvalidated, as documented in the [guide](../../guide.md#claude-code-beta).
 
-`python3 -B test_switcher.py` includes registration/renewal regressions.
+`python3 -B tests/check_switcher.py` includes registration/renewal regressions.
 `ACCOUNT_HUB_TEST_REAL_CODEX=1 python3 -B -m unittest
  tests.test_codex_login.RealCodexLogin.test_native_login_revokes_existing_store_but_plugin_login_preserves_it`
 exercises the official CLI with dummy credentials, a local revocation fixture
