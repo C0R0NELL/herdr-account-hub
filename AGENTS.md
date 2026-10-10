@@ -64,33 +64,38 @@ obtain the user's agreement under the rules above. Human review also checks
 the accuracy and English wording of the subject and notes; format validation
 cannot establish either of those.
 
-This is a manually invoked workflow, not a GitHub Actions workflow. A commit or
-pull request does not create a tag or GitHub Release. Publication requires the
-separate, explicitly authorized `publish` command. The release helper requires
-Python 3.11 or newer; publishing also requires GitHub write permission.
+This is a manually invoked workflow, not a GitHub Actions workflow. One call
+with the approved version and subject validates, commits, pushes, tags, and
+publishes the release. Treat an authorized release as that whole pipeline;
+do not replace it with manual commit/push steps or stop at a local commit.
+The helper requires Python 3.11 or newer, Git, authenticated GitHub CLI (`gh`),
+and repository write permission.
 
 1. Update the official manifest and the first `CHANGELOG.md` entry to the
    approved version. Changelog headings must be `## X.Y.Z - YYYY-MM-DD`, with
    unique versions and nonempty bullet notes. Keep older entries below it.
-2. Run `python3 scripts/release.py --subject '<type>(<scope>): <summary>'` to
+2. Optionally run `python3 scripts/release.py --dry-run --version X.Y.Z --subject
+   '<type>(<scope>): <summary>'` to
    preview the selected version, tag, subject, and exact notes. It has no
    network calls or writes. Review all changes and stage only intended files.
-3. Run `python3 scripts/release.py commit --version X.Y.Z --subject
+3. Once the release is authorized, run
+   `python3 scripts/release.py --version X.Y.Z --subject
    '<type>(<scope>): <summary>'`. Both arguments are required. It checks the
    staged manifest/changelog, Git exclusions, obvious credential patterns,
-   version progression, and both test commands before committing on `main`.
+   version progression, authentication, existing tags/releases, and remote
+   history before creating a commit on `main`. Both test commands must pass.
    Unstaged/untracked files and changes during checks abort the operation.
-4. Once publication is authorized, run
-   `python3 scripts/release.py publish --version X.Y.Z` on the clean committed
-   tree. It reruns both checks, pushes the exact commit and its tag without
-   force, and creates the GitHub Release using those committed notes. Git and
-   the authenticated GitHub CLI (`gh`) are required. Conflicting tags or
-   existing release metadata are never replaced. Retry the same command after
-   a GitHub failure; an already matching published release is a no-op.
+4. The same call commits the supplied subject with the matching changelog notes
+   as its body, pushes that exact commit and tag atomically without force, and
+   creates the GitHub Release with those notes. There is no second publication
+   command. If push or the GitHub API fails after the commit, preserve it and
+   retry the same call with the exact version and subject. A matching already
+   published release is a no-op; conflicting tags/releases are never replaced.
 
-Documentation/test-only maintenance can use a normal Conventional Commit
-without a new changelog version or GitHub Release, after the mandatory version
-review. Never amend published history just to apply the new message convention.
+Documentation/test-only maintenance that is explicitly requested without a
+release can use a normal Conventional Commit and push without a new changelog
+version, after the mandatory version review. Never amend published history just
+to apply the new message convention.
 
 ### Release conventions
 

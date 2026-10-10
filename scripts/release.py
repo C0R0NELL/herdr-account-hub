@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Preview, commit, or publish a release using the official manifest and changelog."""
+"""Validate, commit, push, and publish a release from the manifest and changelog."""
 import argparse
 from datetime import date
 import json
@@ -149,6 +149,7 @@ def commit(version, subject):
     check_files("")
     head = git("rev-parse", "HEAD")
     staged = git("diff", "--cached", "--binary")
+    publication(manifest)
     checks()
     branch()
     clean(staged=True)
@@ -188,15 +189,9 @@ def remote_refs(tag):
     return dict((ref, sha) for sha, ref in (line.split() for line in refs.splitlines()))
 
 
-def publish(version):
-    branch()
-    clean()
-    manifest, notes = release("HEAD")
-    if manifest["version"] != version:
-        raise ReleaseError("The explicitly approved version differs from the committed manifest.")
-    check_files("HEAD")
-    sha = git("rev-parse", "HEAD")
-    tag = "v" + version
+def publication(manifest, sha=None, notes=None):
+    """Check publication prerequisites before creating a commit or pushing it."""
+    tag = "v" + manifest["version"]
     title = manifest["name"] + " " + tag
     repo = repository()
     command("gh", "auth", "status", "--hostname", "github.com")
@@ -206,22 +201,43 @@ def publish(version):
     refs = remote_refs(tag)
     remote_tag = refs.get("refs/tags/" + tag + "^{}", refs.get("refs/tags/" + tag))
     local = command("git", "rev-parse", "--verify", "--quiet", "refs/tags/" + tag + "^{commit}", check=False)
+    if sha is None and (remote_tag or local.returncode == 0 or existing):
+        raise ReleaseError("This version already has a tag or GitHub release; prepare a new version before committing.")
     if (remote_tag and remote_tag != sha) or (local.returncode == 0 and local.stdout.strip() != sha):
         raise ReleaseError("The existing release tag points to a different commit; it will not be moved.")
     if existing:
         if (remote_tag != sha or existing.get("draft") or existing.get("prerelease")
                 or existing["name"] != title or (existing.get("body") or "").strip() != notes):
             raise ReleaseError("This GitHub release already exists with different metadata; it will not be overwritten.")
+    elif refs.get("refs/heads/main"):
+        ancestor = command("git", "merge-base", "--is-ancestor", refs["refs/heads/main"],
+                           sha or "HEAD", check=False)
+        if ancestor.returncode:
+            raise ReleaseError("Remote main is ahead, diverged, or not fetched; reconcile it before releasing.")
+    return repo, tag, title, existing, remote_tag, local.returncode == 0
+
+
+def publish(version, run_checks=True):
+    branch()
+    clean()
+    manifest, notes = release("HEAD")
+    if manifest["version"] != version:
+        raise ReleaseError("The explicitly approved version differs from the committed manifest.")
+    check_files("HEAD")
+    sha = git("rev-parse", "HEAD")
+    repo, tag, title, existing, remote_tag, local_tag = publication(manifest, sha, notes)
+    if existing:
         print(title + " is already published; nothing changed.")
         return
-    checks()
+    if run_checks:
+        checks()
     branch()
     clean()
     if git("rev-parse", "HEAD") != sha:
         raise ReleaseError("HEAD changed during checks; review and retry.")
     push = [sha + ":refs/heads/main"]
     if not remote_tag:
-        if local.returncode:
+        if not local_tag:
             command("git", "tag", "-a", tag, sha, "--cleanup=verbatim", "--file=-",
                     input=title + "\n\n" + notes + "\n")
         push.append("refs/tags/" + tag + ":refs/tags/" + tag)
@@ -238,22 +254,31 @@ def publish(version):
                 "--title", title, "--notes-file", str(path), capture=False)
 
 
+def run_pipeline(version, subject):
+    validate_subject(subject)
+    branch()
+    clean(staged=True)
+    changed = bool(git("diff", "--cached", "--name-only"))
+    if changed:
+        commit(version, subject)
+    manifest, notes = release("HEAD")
+    if manifest["version"] != version:
+        raise ReleaseError("The explicitly approved version differs from the committed manifest.")
+    if git("log", "-1", "--format=%B") != subject + "\n\n" + notes:
+        raise ReleaseError("No matching release commit: stage the intended release changes or retry with its original subject.")
+    publish(version, run_checks=not changed)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("preview", "commit", "publish"), nargs="?", default="preview")
-    parser.add_argument("--version", help="version explicitly agreed with the user; required for commit/publish")
-    parser.add_argument("--subject", help="English Conventional Commit subject; required for commit")
+    parser.add_argument("--version", help="version explicitly agreed with the user; required unless --dry-run")
+    parser.add_argument("--subject", help="English Conventional Commit subject; required unless --dry-run")
+    parser.add_argument("--dry-run", action="store_true", help="preview only, without writes or network calls")
     args = parser.parse_args()
-    if args.action != "preview" and not args.version:
-        parser.error("commit/publish require --version with the explicitly approved version")
-    if args.action == "commit" and not args.subject:
-        parser.error("commit requires --subject")
+    if not args.dry_run and (not args.version or not args.subject):
+        parser.error("--version and --subject are required; this command commits, pushes, and publishes")
     try:
-        if args.action == "commit":
-            commit(args.version, args.subject)
-        elif args.action == "publish":
-            publish(args.version)
-        else:
+        if args.dry_run:
             manifest, notes = release()
             if args.version and args.version != manifest["version"]:
                 raise ReleaseError("The preview version differs from the official manifest.")
@@ -266,6 +291,8 @@ def main():
             if args.subject:
                 print("Commit:\n" + args.subject + "\n")
             print(notes)
+        else:
+            run_pipeline(args.version, args.subject)
     except (ReleaseError, OSError, ValueError, subprocess.CalledProcessError) as error:
         print("release: " + str(error), file=sys.stderr)
         return 1

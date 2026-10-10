@@ -50,41 +50,46 @@ Review all changes since the preceding published tag when writing notes,
 including already committed changes. The helper does not generate summaries
 from commit messages.
 
-The workflow runs locally with Python 3.11 or newer. There is no GitHub Actions
-release workflow: committing or opening a PR does not publish anything. Only
-the separate `publish` command pushes the release commit/tag and creates the
-GitHub Release, using an account with repository write permission.
+The workflow runs locally with Python 3.11 or newer, Git, and authenticated
+GitHub CLI (`gh`) with repository write permission. A single invocation with
+the agreed version and subject validates, commits, pushes, tags, and publishes.
+There is no GitHub Actions release workflow or separate publication command.
 
 From the checkout root, preview without writes or network requests:
 
 ```sh
-python3 scripts/release.py --subject 'fix(picker): keep accounts visible during lock contention'
+python3 scripts/release.py --dry-run --version X.Y.Z --subject 'fix(picker): describe the actual fix'
 ```
 
-After staging the intended files, create the release commit with the approved
-version and a subject appropriate to its diff. Then publish when authorized:
+After staging the reviewed files, run the entire authorized release pipeline
+with the approved version and a subject appropriate to its diff:
 
 ```sh
-python3 scripts/release.py commit --version X.Y.Z --subject 'fix(picker): describe the actual fix'
-python3 scripts/release.py publish --version X.Y.Z
+python3 scripts/release.py --version X.Y.Z --subject 'fix(picker): describe the actual fix'
 ```
 
-Replace `X.Y.Z` with the agreed version. Commit runs the unit/terminal/release
-checks and the managed-install integration check. Publish repeats those checks
-on a clean committed tree, pushes that exact commit and its `vX.Y.Z` tag
-atomically without force, then creates the GitHub Release. It uses the configured
-GitHub `origin` and authenticated `gh`; ordinary plugin installation needs neither
-this script nor a GitHub login. Existing conflicting tags/releases are rejected.
-After a GitHub API failure, retry the same publish command: the commit and tag
-are preserved, and a matching already published release is not duplicated.
+Replace `X.Y.Z` with the agreed version. Manifest/changelog mismatches, invalid
+subjects, authentication failures, and known tag/remote-history conflicts stop
+before a commit. The unit/terminal/release checks and managed-install integration
+check must pass too. The commit uses the supplied subject and the matching notes
+as its body. That exact commit and its `vX.Y.Z` tag are then pushed atomically
+without force, followed by the GitHub Release with those notes. Existing
+conflicting tags/releases are rejected. Ordinary plugin installation needs
+neither this script nor a GitHub login.
+
+Git push and GitHub Release creation are separate external operations. A failure
+after the local commit preserves that commit and any successfully pushed tag.
+Retry the exact same invocation: it verifies the version, subject, and notes and
+resumes publication without another commit. Both checks run when resuming an
+unpublished commit. An already matching published release is not duplicated.
 
 The GitHub Release title is generated from the official name and version. GitHub
 receives committed notes through a temporary file and `gh release create
 --verify-tag --notes-file`; no separate text needs to be authored. See the
 [GitHub CLI](https://cli.github.com/manual/gh_release_create) and
 [GitHub Release API](https://docs.github.com/en/rest/releases/releases#create-a-release).
-Documentation/test-only maintenance uses an ordinary Conventional Commit and
-does not require another plugin version or GitHub Release.
+Documentation/test-only maintenance explicitly requested without a release can
+use an ordinary Conventional Commit and push without another plugin version.
 
 The current [Herdr plugin documentation](https://herdr.dev/docs/plugins/)
 describes `herdr plugin update` for managed installs. Verify that the installed

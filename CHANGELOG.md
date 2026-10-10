@@ -10,6 +10,17 @@
 - Add a blank line between the Codex and Claude Code sections, including when
   no Codex accounts have been saved.
 
+### Maintenance
+
+- Add a single-command release pipeline that validates the requested version
+  against the official manifest and changelog, runs checks, commits with English
+  Conventional Commits, pushes the exact commit/tag, and publishes the matching
+  changelog notes as the GitHub Release body.
+- Preserve the release commit when publication fails so repeating the same
+  command resumes without another commit or replacing an existing tag.
+- Consolidate the check entrypoint under `tests/` and cover release operations
+  with temporary Git repositories and a fake GitHub CLI.
+
 ## 0.3.0 - 2026-10-10
 
 ### Added

@@ -61,6 +61,8 @@ with (base / "gh-calls.jsonl").open("a") as log:
     log.write(json.dumps(args) + "\n")
 state = base / "release.json"
 if args[:2] == ["auth", "status"]:
+    if (base / "fail-auth").exists():
+        sys.exit("simulated authentication failure")
     pass
 elif args[0] == "api":
     print(json.dumps([[json.loads(state.read_text())] if state.exists() else []]))
@@ -99,15 +101,106 @@ else:
 
     def committed(self):
         self.prepared()
-        result = self.invoke("commit", "--version", "0.1.1", "--subject",
+        self.git("commit", "--cleanup=verbatim", "-m",
+                 "fix(picker): preserve account history\n\n" + NOTES)
+        return self.git("rev-parse", "HEAD")
+
+    def test_single_invocation_commits_pushes_and_publishes_matching_notes(self):
+        self.prepared()
+        before = self.git("rev-parse", "HEAD")
+        result = self.invoke("--version", "0.1.1", "--subject",
                              "fix(picker): preserve account history")
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
-        return self.git("rev-parse", "HEAD")
+        sha = self.git("rev-parse", "HEAD")
+        self.assertNotEqual(sha, before)
+        self.assertEqual(self.git("log", "-1", "--format=%B"),
+                         "fix(picker): preserve account history\n\n" + NOTES)
+        self.assertEqual(self.git("--git-dir=" + str(self.remote), "rev-parse", "main"), sha)
+        self.assertEqual(self.git("--git-dir=" + str(self.remote), "rev-parse", "v0.1.1^{}"), sha)
+        release = json.loads((self.base / "release.json").read_text())
+        self.assertEqual(release["name"], "Account Hub v0.1.1")
+        self.assertEqual(release["body"], NOTES + "\n")
+        self.assertEqual(len((self.base / "checks-ran").read_text().splitlines()), 2)
+
+    def test_single_invocation_auth_failure_stops_before_commit(self):
+        self.prepared()
+        before = self.git("rev-parse", "HEAD")
+        (self.base / "fail-auth").touch()
+        result = self.invoke("--version", "0.1.1", "--subject",
+                             "fix(picker): preserve account history")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.git("rev-parse", "HEAD"), before)
+        self.assertFalse((self.base / "checks-ran").exists())
+        self.assertFalse((self.base / "release.json").exists())
+
+    def test_single_invocation_failure_can_resume_without_another_commit(self):
+        self.prepared()
+        before = self.git("rev-parse", "HEAD")
+        (self.base / "fail-release").touch()
+        failed = self.invoke("--version", "0.1.1", "--subject",
+                             "fix(picker): preserve account history")
+        self.assertNotEqual(failed.returncode, 0)
+        sha = self.git("rev-parse", "HEAD")
+        self.assertNotEqual(sha, before)
+        (self.base / "fail-release").unlink()
+        retry = self.invoke("--version", "0.1.1", "--subject",
+                            "fix(picker): preserve account history")
+        self.assertEqual(retry.returncode, 0, retry.stderr + retry.stdout)
+        self.assertEqual(self.git("rev-parse", "HEAD"), sha)
+        self.assertEqual(self.git("--git-dir=" + str(self.remote), "rev-parse", "v0.1.1^{}"), sha)
+
+    def test_taken_version_stops_before_creating_a_commit(self):
+        self.prepared()
+        before = self.git("rev-parse", "HEAD")
+        self.git("tag", "v0.1.1", before)
+        result = self.invoke("--version", "0.1.1", "--subject",
+                             "fix(picker): preserve account history")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("already has a tag", result.stderr)
+        self.assertEqual(self.git("rev-parse", "HEAD"), before)
+        self.assertFalse((self.base / "checks-ran").exists())
+        self.assertFalse((self.base / "release.json").exists())
+
+    def test_remote_work_stops_before_creating_a_commit(self):
+        self.prepared()
+        before = self.git("rev-parse", "HEAD")
+        self.git("--git-dir=" + str(self.remote), "symbolic-ref", "HEAD", "refs/heads/main")
+        other = self.base / "other"
+        self.git("clone", str(self.remote), str(other))
+        subprocess.run(["git", "-c", "user.name=Other", "-c", "user.email=other@example.invalid",
+                        "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "chore: other work"],
+                       cwd=other, env=self.env, check=True, capture_output=True)
+        subprocess.run(["git", "push", "origin", "main"], cwd=other, env=self.env,
+                       check=True, capture_output=True)
+        remote_before = self.git("--git-dir=" + str(self.remote), "rev-parse", "main")
+        result = self.invoke("--version", "0.1.1", "--subject",
+                             "fix(picker): preserve account history")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Remote main", result.stderr)
+        self.assertEqual(self.git("rev-parse", "HEAD"), before)
+        self.assertEqual(self.git("--git-dir=" + str(self.remote), "rev-parse", "main"), remote_before)
+        self.assertFalse((self.base / "checks-ran").exists())
+        self.assertFalse((self.base / "release.json").exists())
+
+    def test_retry_requires_the_exact_version_subject_and_notes(self):
+        sha = self.committed()
+        for version, subject in (("0.1.2", "fix(picker): preserve account history"),
+                                 ("0.1.1", "fix(picker): an unrelated change")):
+            with self.subTest(version=version, subject=subject):
+                result = self.invoke("--version", version, "--subject", subject)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.git("rev-parse", "HEAD"), sha)
+        self.git("commit", "--amend", "--cleanup=verbatim", "-m",
+                 "fix(picker): preserve account history\n\n- Incorrect notes.")
+        result = self.invoke("--version", "0.1.1", "--subject", "fix(picker): preserve account history")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.base / "gh-calls.jsonl").exists())
 
     def test_preview_is_read_only_and_extracts_only_the_matching_release(self):
         self.prepared()
         before = self.git("rev-parse", "HEAD")
-        result = self.invoke("--subject", "fix(picker): preserve account history")
+        result = self.invoke("--dry-run", "--version", "0.1.1", "--subject",
+                             "fix(picker): preserve account history")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(NOTES, result.stdout)
         self.assertNotIn("Older release", result.stdout)
@@ -115,11 +208,15 @@ else:
         self.assertFalse((self.base / "gh-calls.jsonl").exists())
         self.assertFalse((self.base / "checks-ran").exists())
 
-    def test_commit_uses_conventional_subject_and_exact_changelog_body(self):
-        self.committed()
-        self.assertEqual(self.git("log", "-1", "--format=%B"),
-                         "fix(picker): preserve account history\n\n" + NOTES)
-        self.assertEqual(len((self.base / "checks-ran").read_text().splitlines()), 2)
+    def test_incomplete_arguments_never_start_the_pipeline(self):
+        self.prepared()
+        before = self.git("rev-parse", "HEAD")
+        for arguments in ((), ("--version", "0.1.1"),
+                          ("--subject", "fix(picker): preserve account history")):
+            with self.subTest(arguments=arguments):
+                result = self.invoke(*arguments)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.git("rev-parse", "HEAD"), before)
         self.assertFalse((self.base / "gh-calls.jsonl").exists())
 
     def test_bad_or_duplicate_changelog_entries_never_commit(self):
@@ -131,20 +228,24 @@ else:
             with self.subTest(extra=extra, notes=notes):
                 self.metadata(extra=extra, notes=notes)
                 self.git("add", "CHANGELOG.md")
-                result = self.invoke("commit", "--version", "0.1.1", "--subject", "fix(picker): keep history")
+                result = self.invoke("--version", "0.1.1", "--subject", "fix(picker): keep history")
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(self.git("rev-parse", "HEAD"), before)
         self.assertFalse((self.base / "checks-ran").exists())
+        self.assertFalse((self.base / "gh-calls.jsonl").exists())
 
     def test_mismatched_version_and_nonconventional_subject_never_commit(self):
         self.prepared()
+        before = self.git("rev-parse", "HEAD")
         for version, subject in (("0.1.2", "fix(picker): keep history"),
                                  ("0.1.1", "Release Account Hub v0.1.1"),
                                  ("0.1.1", "fix(picker): keep history\nother subject")):
             with self.subTest(version=version, subject=subject):
-                result = self.invoke("commit", "--version", version, "--subject", subject)
+                result = self.invoke("--version", version, "--subject", subject)
                 self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.git("rev-parse", "HEAD"), before)
         self.assertFalse((self.base / "checks-ran").exists())
+        self.assertFalse((self.base / "gh-calls.jsonl").exists())
 
     def test_wrong_changelog_version_and_invalid_dates_stop_before_checks(self):
         self.prepared()
@@ -152,7 +253,7 @@ else:
             with self.subTest(heading=heading):
                 (self.root / "CHANGELOG.md").write_text(heading + "\n\n" + NOTES + "\n")
                 self.git("add", "CHANGELOG.md")
-                result = self.invoke("commit", "--version", "0.1.1", "--subject", "fix(picker): keep history")
+                result = self.invoke("--version", "0.1.1", "--subject", "fix(picker): keep history")
                 self.assertNotEqual(result.returncode, 0)
         self.assertFalse((self.base / "checks-ran").exists())
 
@@ -160,7 +261,7 @@ else:
         self.prepared()
         for subject in ("feat(picker): add controls", "fix(picker)!: change a contract"):
             with self.subTest(subject=subject):
-                result = self.invoke("commit", "--version", "0.1.1", "--subject", subject)
+                result = self.invoke("--version", "0.1.1", "--subject", subject)
                 self.assertNotEqual(result.returncode, 0)
         self.assertFalse((self.base / "checks-ran").exists())
 
@@ -169,7 +270,7 @@ else:
         (self.root / ".gitignore").write_text("")
         (self.root / "auth.json").write_text('{"fake": true}')
         self.git("add", ".gitignore", "auth.json")
-        result = self.invoke("commit", "--version", "0.1.1", "--subject", "fix(picker): keep history")
+        result = self.invoke("--version", "0.1.1", "--subject", "fix(picker): keep history")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Private/generated file", result.stderr)
         self.assertFalse((self.base / "checks-ran").exists())
@@ -181,7 +282,7 @@ else:
             "from pathlib import Path\n"
             "Path(__file__).resolve().parents[1].joinpath('switcher.py').write_text('# Unreviewed change\\n')\n")
         self.git("add", "tests/check_switcher.py")
-        result = self.invoke("commit", "--version", "0.1.1", "--subject", "fix(picker): keep history")
+        result = self.invoke("--version", "0.1.1", "--subject", "fix(picker): keep history")
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self.git("rev-parse", "HEAD"), before)
 
@@ -189,31 +290,31 @@ else:
         self.prepared()
         before = self.git("rev-parse", "HEAD")
         (self.root / "switcher.py").write_text("# Unreviewed edit\n")
-        result = self.invoke("commit", "--version", "0.1.1", "--subject", "fix(picker): keep history")
+        result = self.invoke("--version", "0.1.1", "--subject", "fix(picker): keep history")
         self.assertNotEqual(result.returncode, 0)
         self.git("checkout", "--", "switcher.py")
         (self.root / ".local").mkdir()
         (self.root / ".local/auth.json").write_text('{"fake": true}')
         self.git("add", "-f", ".local/auth.json")
-        result = self.invoke("commit", "--version", "0.1.1", "--subject", "fix(picker): keep history")
+        result = self.invoke("--version", "0.1.1", "--subject", "fix(picker): keep history")
         self.assertNotEqual(result.returncode, 0)
         self.git("reset", "--", ".local/auth.json")
         (self.root / "tests/check_switcher.py").write_text("raise SystemExit(1)\n")
         self.git("add", "tests/check_switcher.py")
-        result = self.invoke("commit", "--version", "0.1.1", "--subject", "fix(picker): keep history")
+        result = self.invoke("--version", "0.1.1", "--subject", "fix(picker): keep history")
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self.git("rev-parse", "HEAD"), before)
 
     def test_publish_pushes_exact_commit_and_reuses_changelog_notes(self):
         sha = self.committed()
-        result = self.invoke("publish", "--version", "0.1.1")
+        result = self.invoke("--version", "0.1.1", "--subject", "fix(picker): preserve account history")
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         self.assertEqual(self.git("--git-dir=" + str(self.remote), "rev-parse", "main"), sha)
         self.assertEqual(self.git("--git-dir=" + str(self.remote), "rev-parse", "v0.1.1^{}"), sha)
         release = json.loads((self.base / "release.json").read_text())
         self.assertEqual(release["body"], NOTES + "\n")
         self.assertEqual(release["name"], "Account Hub v0.1.1")
-        again = self.invoke("publish", "--version", "0.1.1")
+        again = self.invoke("--version", "0.1.1", "--subject", "fix(picker): preserve account history")
         self.assertEqual(again.returncode, 0, again.stderr + again.stdout)
         calls = [json.loads(line) for line in (self.base / "gh-calls.jsonl").read_text().splitlines()]
         self.assertEqual(sum(call[:2] == ["release", "create"] for call in calls), 1)
@@ -221,7 +322,7 @@ else:
     def test_conflicting_tag_or_remote_main_prevents_publication(self):
         sha = self.committed()
         self.git("tag", "v0.1.1", "HEAD^")
-        result = self.invoke("publish", "--version", "0.1.1")
+        result = self.invoke("--version", "0.1.1", "--subject", "fix(picker): preserve account history")
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse((self.base / "release.json").exists())
         self.git("tag", "-d", "v0.1.1")
@@ -235,7 +336,7 @@ else:
         subprocess.run(["git", "push", "origin", "main"], cwd=other, env=self.env,
                        check=True, capture_output=True)
         remote_before = self.git("--git-dir=" + str(self.remote), "rev-parse", "main")
-        result = self.invoke("publish", "--version", "0.1.1")
+        result = self.invoke("--version", "0.1.1", "--subject", "fix(picker): preserve account history")
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self.git("--git-dir=" + str(self.remote), "rev-parse", "main"), remote_before)
         self.assertFalse(self.git("--git-dir=" + str(self.remote), "tag", "--list", "v0.1.1"))
@@ -244,18 +345,18 @@ else:
     def test_retry_after_github_failure_keeps_the_same_commit_and_tag(self):
         sha = self.committed()
         (self.base / "fail-release").touch()
-        failed = self.invoke("publish", "--version", "0.1.1")
+        failed = self.invoke("--version", "0.1.1", "--subject", "fix(picker): preserve account history")
         self.assertNotEqual(failed.returncode, 0)
         self.assertEqual(self.git("rev-parse", "v0.1.1^{}"), sha)
         (self.base / "fail-release").unlink()
-        retry = self.invoke("publish", "--version", "0.1.1")
+        retry = self.invoke("--version", "0.1.1", "--subject", "fix(picker): preserve account history")
         self.assertEqual(retry.returncode, 0, retry.stderr + retry.stdout)
         self.assertEqual(self.git("--git-dir=" + str(self.remote), "rev-parse", "v0.1.1^{}"), sha)
 
     def test_existing_release_metadata_and_dirty_checkout_are_not_published(self):
         sha = self.committed()
         (self.root / "unreviewed.txt").touch()
-        dirty = self.invoke("publish", "--version", "0.1.1")
+        dirty = self.invoke("--version", "0.1.1", "--subject", "fix(picker): preserve account history")
         self.assertNotEqual(dirty.returncode, 0)
         self.assertFalse((self.base / "gh-calls.jsonl").exists())
         (self.root / "unreviewed.txt").unlink()
@@ -264,7 +365,7 @@ else:
         (self.base / "release.json").write_text(json.dumps({
             "tag_name": "v0.1.1", "name": "Account Hub v0.1.1",
             "body": "Different published notes", "draft": False, "prerelease": False}))
-        conflict = self.invoke("publish", "--version", "0.1.1")
+        conflict = self.invoke("--version", "0.1.1", "--subject", "fix(picker): preserve account history")
         self.assertNotEqual(conflict.returncode, 0)
         self.assertEqual(json.loads((self.base / "release.json").read_text())["body"], "Different published notes")
 
