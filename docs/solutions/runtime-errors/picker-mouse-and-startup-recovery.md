@@ -78,3 +78,53 @@ for centered Enter/Esc controls (including a click outside the modal), and a
 usage-column click followed by a modal Enter click. The parent sends each packet
 after the corresponding screen is drawn, matching separate user gestures instead
 of allowing ncurses to coalesce queued clicks before the first dialog appears.
+
+# Herdr popup captures navigation
+
+On 2026-10-10, replacing the normal picker overlay with a full-size `popup`
+blocked the user's navigation, including clicks on tabs and the sidebar. Herdr's
+[pane documentation](https://herdr.dev/docs/plugins/#panes) defines popups as
+session-modal terminals that receive all terminal input. The official
+[`handle_mouse` implementation](https://github.com/herdrdev/herdr/blob/master/src/client/shell/mouse.rs)
+checks the popup before the tab and workspace controls and returns without
+dispatching those clicks. Its
+[popup input tests](https://github.com/herdrdev/herdr/blob/master/src/client/shell/tests/popup_focus_projection.rs)
+also specify that popup input takes precedence over shell controls. This is host
+placement behavior, separate from the picker's curses mouse mask.
+
+The popup attempt was reverted in both `cmd_open` and the manifest, and the
+development registration was linked back to `overlay`. Keep that placement when
+normal Herdr navigation must remain available. A direct foreground `ui` command
+in an idle terminal is a different launch path; plugin actions run detached and
+cannot simply take over the foreground terminal.
+
+The earlier isolated Herdr popup check verified rendering, unchanged pane layout,
+and Escape restoration, but did not check navigation outside the popup. The
+plugin's checks passed after the rollback. Native picker mouse tests alone do
+not establish that Herdr's tabs, sidebar, or prefix shortcuts remain usable.
+
+# Picker closes during account-store contention
+
+Also on 2026-10-10, direct `python3 switcher.py ui` reported a five-second lock
+timeout. At inspection, both production and development locks were available and
+no picker process was running, so the original holder could not be identified.
+Usage refresh, token renewal, and switching share the same lock; the timeout
+message alone does not establish that a switch was stuck.
+
+A fictitious-account fixture held the real `flock` through a separate descriptor.
+The picker then raised the reported error on entry; taking the lock after the
+first frame also reproduced an exit during the normal cache reread. Both
+regressions failed before the fix and passed afterward.
+
+Picker usage reads now attempt the existing re-entrant lock without waiting. A
+`LockBusy` refusal preserves the last displayed reading, shows a waiting notice,
+and queues another attempt on the next UI tick. Entry and manual refresh retain
+their request for fresh usage until they succeed. Escape remains available while
+another process holds the lock. The normal serialized usage reader, credential
+changes, and their default wait deadline remain in place; the picker never
+removes or bypasses another process's lock.
+
+`tests/test_usage_picker.py` covers opening and quitting while locked, contention
+after a successful reading, a queued manual refresh, and recovery after release,
+without real logins or provider requests. The full plugin checks passed. This
+addresses store contention independently of Herdr placement and its zoom marker.

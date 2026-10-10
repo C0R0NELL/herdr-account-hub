@@ -2,6 +2,7 @@
 """Account-list navigation and usage isolation with fictitious logins only."""
 import importlib.util
 import copy
+import fcntl
 import io
 import os
 from pathlib import Path
@@ -351,6 +352,43 @@ class UsagePicker(unittest.TestCase):
         frames = self.picker([258] * 4 + [ord("q")], height=9)
         self.assertTrue(any("Echo" in text for text in frames[-1]["selected"]), frames[-1])
         self.assertIn("5 accounts", frames[-1]["lines"][0])
+
+    def test_picker_opens_and_can_quit_while_another_operation_holds_the_lock(self):
+        self.S.LOCK_TIMEOUT_S = 0.01
+        holder = open(self.S.LOCK, "a")
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        try:
+            frames = self.picker([27], height=14)
+        finally:
+            fcntl.flock(holder, fcntl.LOCK_UN)
+            holder.close()
+        self.assertTrue(any("Alpha" in text for text in frames[-1]["lines"].values()))
+        self.assertTrue(any("Waiting for another account operation" in text
+                            for text in frames[-1]["lines"].values()))
+        self.assertEqual(self.reads, [], "An unavailable lock must not permit provider reads")
+
+    def test_picker_keeps_usage_during_contention_and_refreshes_after_release(self):
+        self.S.LOCK_TIMEOUT_S = 0.01
+        holder = open(self.S.LOCK, "a")
+        def take_lock():
+            fcntl.flock(holder, fcntl.LOCK_EX)
+            return -1
+        def release_lock():
+            fcntl.flock(holder, fcntl.LOCK_UN)
+            return -1
+        try:
+            frames = self.picker([take_lock, ord('r'), release_lock, 27], height=14)
+        finally:
+            fcntl.flock(holder, fcntl.LOCK_UN)
+            holder.close()
+        waiting = [frame for frame in frames if any(
+            "Waiting for another account operation" in text
+            for text in frame["lines"].values())]
+        self.assertTrue(waiting, "A busy refresh must remain visible instead of closing the picker")
+        self.assertTrue(any("10%" in text for text in waiting[-1]["lines"].values()))
+        self.assertFalse(any("Waiting for another account operation" in text
+                             for text in frames[-1]["lines"].values()))
+        self.assertEqual(len(self.reads), 10, "The queued manual refresh must run once after release")
 
     def test_expanded_usage_scrolls_to_selected_account(self):
         frames = self.picker([ord("d")] + [258] * 4 + [ord("q")], height=14)

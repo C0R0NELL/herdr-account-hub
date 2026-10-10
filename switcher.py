@@ -184,6 +184,10 @@ class SwitchError(Exception):
     """An operation that could not be confirmed; message describes recovery."""
 
 
+class LockBusy(SwitchError):
+    """Another process owns the account store; no protected operation started."""
+
+
 # ---- running a command ----------------------------------------------------
 
 def _abandon(proc):
@@ -307,11 +311,15 @@ class _Lock:
     _depth = 0
     _file = None
 
+    def __init__(self, timeout=None):
+        self.timeout = timeout
+
     def __enter__(self):
         if _Lock._depth == 0:
             _secure_dir(STATE_DIR)
             handle = open(LOCK, "w")
-            began = time.time()
+            timeout = LOCK_TIMEOUT_S if self.timeout is None else self.timeout
+            began = time.monotonic()
             while True:
                 try:
                     fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -320,12 +328,12 @@ class _Lock:
                 # cannot be taken at all still raises, rather than spending the
                 # timeout to report a holder that was never there.
                 except BlockingIOError:
-                    if time.time() - began >= LOCK_TIMEOUT_S:
+                    if time.monotonic() - began >= timeout:
                         handle.close()
-                        raise SwitchError(
+                        raise LockBusy(
                             "another switch is still running — it has held the "
                             "lock for over %gs and may be stuck; nothing "
-                            "changed" % LOCK_TIMEOUT_S
+                            "changed" % timeout
                         )
                     time.sleep(0.05)
             _Lock._file = handle
@@ -3630,26 +3638,45 @@ def cmd_ui(argv):
         # Opening requests fresh usage, even if a recent cache lacks new fields.
         # Later ticks follow the TTL or scheduled post-reset checks. Every read
         # still observes each account's Retry-After.
-        usage = {"%s:%s" % (r["kind"], r["id"]): r for r in usage_rows(force=True)}
-        usage_fetched = time.time()
-        usage_profiles = set(usage)
+        usage = {}
+        usage_fetched = 0
+        usage_profiles = set()
+        waiting_for_usage = False
+        force_pending = False
+
+        def read_usage(refresh=True, force=False):
+            nonlocal usage, usage_fetched, usage_profiles, waiting_for_usage, force_pending
+            try:
+                # Keep the normal serialized reader, but don't block the UI
+                # behind another picker, token renewal, or account change.
+                with _Lock(timeout=0):
+                    readings = usage_rows(refresh=refresh, force=force)
+            except LockBusy:
+                waiting_for_usage = True
+                force_pending = force_pending or force
+                return False
+            usage = {"%s:%s" % (r["kind"], r["id"]): r for r in readings}
+            waiting_for_usage = False
+            if refresh:
+                usage_fetched = time.time()
+                usage_profiles = set(usage)
+                force_pending = False
+            return True
+
+        read_usage(force=True)
         while True:
             _sync_picker_size(stdscr)
             rows = _rows()
             profile_keys = {"%s:%s" % (kind, body["id"])
                             for row_type, kind, body in rows if row_type == "profile"}
-            if (time.time() - usage_fetched >= USAGE_TTL_S
+            if (waiting_for_usage or time.time() - usage_fetched >= USAGE_TTL_S
                     or profile_keys != usage_profiles
                     or any(r.get("refresh_after") is not None
                            and time.time() >= r["refresh_after"] for r in usage.values())):
-                usage = {"%s:%s" % (r["kind"], r["id"]): r for r in usage_rows()}
-                usage_fetched = time.time()
-                usage_profiles = {"%s:%s" % (kind, body["id"])
-                                  for row_type, kind, body in rows if row_type == "profile"}
+                read_usage(force=force_pending)
             else:
                 # Another switcher pane may already have fetched newer usage.
-                usage = {"%s:%s" % (r["kind"], r["id"]): r
-                         for r in usage_rows(refresh=False)}
+                read_usage(refresh=False)
             pickable = [
                 i for i, r in enumerate(rows)
                 if r[0] == "profile" or (r[0] == "empty" and r[1])
@@ -3676,6 +3703,8 @@ def cmd_ui(argv):
             for i, (kind_row, kind, body) in enumerate(rows):
                 start = len(lines)
                 if kind_row == "head":
+                    if lines:
+                        lines.append(("", curses.A_NORMAL, None, False))
                     lines.append((body, curses.A_BOLD | curses.A_UNDERLINE, None, False))
                 elif kind_row == "empty":
                     is_sel = pickable and i == pickable[sel]
@@ -3739,7 +3768,8 @@ def cmd_ui(argv):
                 stdscr.addnstr(navigation_y, 0, navigation, w - 1, curses.A_DIM)
             notice = "~ last known usage | d details" if any(
                 usage_notice(r) for r in usage.values()) else ""
-            _picker_footer(stdscr, message or notice,
+            waiting_notice = "Waiting for another account operation; refresh will retry."
+            _picker_footer(stdscr, waiting_notice if waiting_for_usage else message or notice,
                            curses.A_BOLD if message else curses.A_DIM)
 
             if pending_action:
@@ -3908,13 +3938,13 @@ def cmd_ui(argv):
                 stdscr.clearok(True)
                 message = "refreshing accounts…"
                 _picker_footer(stdscr, message)
-                usage = {"%s:%s" % (r["kind"], r["id"]): r for r in usage_rows(force=True)}
-                usage_fetched = time.time()
-                usage_profiles = set(usage)
-                stale = [r["label"] for r in usage.values() if r["state"] != "live"]
-                message = "accounts refreshed"
-                if stale:
-                    message += "; cached for " + ", ".join(stale)
+                if read_usage(force=True):
+                    stale = [r["label"] for r in usage.values() if r["state"] != "live"]
+                    message = "accounts refreshed"
+                    if stale:
+                        message += "; cached for " + ", ".join(stale)
+                else:
+                    message = ""
             elif ch == ord("x") and selected:
                 profile = selected[2]
                 # Deleting a profile removes this plugin's copy, never the

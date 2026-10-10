@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.1 - 2026-10-10
+
+### Fixed
+
+- Keep the picker open when another account operation holds the shared lock.
+  Preserve the last usage reading, show a waiting notice, and retry refresh
+  after the lock becomes available. Escape remains available while waiting.
+- Add a blank line between the Codex and Claude Code sections, including when
+  no Codex accounts have been saved.
+
 ## 0.3.0 - 2026-10-10
 
 ### Added
