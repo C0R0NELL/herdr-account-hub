@@ -1,33 +1,11 @@
 id = "c0r0nell.account-hub"
 name = "Account Hub"
-version = "0.1.0"
+version = "0.2.0"
 min_herdr_version = "0.8.0"
-description = "Hot-swap Claude Code / Codex logins without re-authenticating. Overlay picker, cycle-to-next keybinding, and a per-pane account badge ($acct)."
+description = "Manage independent account profiles. Switch the Codex account for this machine and reload existing chats while preserving history and titles."
 platforms = ["macos", "linux"]
 
-# Re-stamp the $acct badges after a server restart / live handoff. Badges are
-# display-only, so a missed stamp costs nothing but a stale-looking sidebar.
-[[startup]]
-command = ["python3", "switcher.py", "stamp"]
-
-# Add $acct to the sidebar rows, so the badge is actually rendered. Backs the
-# config up first and reloads the server. Startup only warns; this one writes.
-[[actions]]
-id = "enable-badge"
-title = "Account Hub: add the $acct badge to the sidebar"
-contexts = ["global"]
-command = ["python3", "switcher.py", "enable-badge"]
-
-# The reverse: take $acct out of the rows and clear it off the panes. For when
-# you would rather show the account once in the tab bar than on every row.
-[[actions]]
-id = "disable-badge"
-title = "Account Hub: remove the $acct badge from the sidebar"
-contexts = ["global"]
-command = ["python3", "switcher.py", "disable-badge"]
-
-# The picker (save / switch / rename / delete). `global` context: it is not
-# about any one pane, the credentials it swaps are machine-wide per agent kind.
+# The picker manages profiles and confirms machine-wide Codex account changes.
 [[actions]]
 id = "open"
 title = "Account Hub: open picker"
@@ -49,27 +27,8 @@ title = "Account Hub: save current login as a profile"
 contexts = ["global"]
 command = ["python3", "switcher.py", "save"]
 
-[[actions]]
-id = "status"
-title = "Account Hub: status"
-contexts = ["global"]
-command = ["python3", "switcher.py", "status"]
-
-# What is left on every saved account, both agent kinds, in one panel.
-[[actions]]
-id = "usage"
-title = "Account Hub: open usage"
-contexts = ["global"]
-command = ["python3", "switcher.py", "open-usage"]
-
 [[panes]]
 id = "picker"
 title = "Account Hub"
 command = ["python3", "switcher.py", "ui"]
-placement = "overlay"
-
-[[panes]]
-id = "usage"
-title = "Account Hub Usage"
-command = ["python3", "switcher.py", "usage-ui"]
 placement = "overlay"

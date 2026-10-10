@@ -51,12 +51,48 @@ What is established: the grant died, and the plan string changed across it. What
 is not: that the upgrade is what killed it. Check the snapshot's plan string
 against the live one before hunting anywhere else.
 
-**Codex revocation is scoped to the installation, not to the account.**
-`CODEX_HOME` contains an `installation_id`, and signing in revokes only grants
-issued under *that* id — including grants for a different account. So a
-`codex login`, from the CLI or from Codex desktop which share `~/.codex`, kills
-whatever that home held before. A grant obtained under a separate `CODEX_HOME`
-survives it.
+**Starting a new Codex CLI login revokes the existing grant.**
+Re-established on Codex 0.162.0, 2026-10-09. Official source
+`codex-rs/cli/src/login.rs` calls `clear_existing_auth_before_login`, which calls
+`logout_with_revoke`, for both browser and device-code sign-in. A real-binary,
+local-only test with fictitious tokens proved that `codex login --device-auth`
+sends a revocation request for the auth file in its home before starting login.
+The earlier installation-ID explanation does not establish this version's
+behavior; do not rely on it to collect several logins in the shared home.
+
+Account Hub now starts official sign-in in a fresh temporary credential folder
+with no auth file to revoke. Only the result is stored under the explicit local
+registration UUID, while all actual chats continue using the user's shared
+Codex home. This is an authentication-only staging folder, not per-account chat
+history. The same real-binary test confirmed that the staged flow sends no
+revocation request and leaves the working shared auth file unchanged.
+
+## Official references and investigation evidence (2026-10-09)
+
+- The official [authentication documentation](https://learn.chatgpt.com/docs/auth)
+  establishes that the CLI and IDE share cached credentials, that file storage
+  lives under `CODEX_HOME`, and that Codex automatically refreshes active tokens.
+  It also identifies `codex-login.log` as the log for direct CLI sign-in. It does
+  not itself describe the CLI's pre-login revocation; that was established from
+  the official 0.162.0 source and the local-only native test above.
+- The shared home's login log records device-code sign-in starts at 22:55:09,
+  22:59:42 and several times between 23:00 and 23:02 UTC. The user explicitly
+  confirmed using `codex login` in the terminal to collect/reauthenticate the
+  registrations. Together with the native test, this establishes a revocation
+  mechanism present in the user's actual workflow. It does not identify which
+  grant each historical request revoked; no provider audit was performed.
+- The official [accounts and sessions guidance](https://developers.openai.com/siwc/token-sharing-open-source/profiles-and-sessions)
+  says to retain the latest replacement tokens and serialize refreshes for the
+  same session. Its [recovery guidance](https://developers.openai.com/siwc/token-sharing-open-source/errors-and-recovery)
+  distinguishes unusable refresh tokens such as `refresh_token_invalidated`
+  and `refresh_token_reused` from temporary failures. These pages describe the
+  separate Sign in with ChatGPT integration flow: do not substitute its dynamic
+  client IDs, token endpoint or lifetimes for the Codex CLI's token format.
+- A usage-cache refresh is not a new sign-in, and deleting a usage cache cannot
+  restore a grant revoked on the server. Recover affected UUIDs with the
+  plugin's isolated `a` action, add new registrations with `c`, and apply a saved
+  registration with Enter. Avoid sequential direct sign-ins in the shared home
+  when collecting accounts for later switching.
 
 # What Didn't Work
 
@@ -94,11 +130,36 @@ and, when the target's access token is clock-expired, one refresh rotation.
   that account has. `renew_profile` stages it to disk first for that reason.
 - Refresh a profile's snapshot as you park it, so a switch away does not leave a
   copy that can no longer renew.
-- For codex, expect a login anywhere in `~/.codex` — including Codex desktop — to
-  revoke the previous grant in that home.
+- For Codex CLI 0.162.0, collect new registrations using the plugin's `c` sign-in
+  action, and reauthenticate existing UUIDs with `a`. Calling `codex login` in
+  the shared home revokes its existing OAuth login before sign-in.
 - Expect an upgraded account to look exactly like a revoked one. The snapshot
   still names the old plan, and only a fresh login carries the new one.
 
 Covered by `test_switcher.py`: a retired profile is refused with the live store
 untouched and nothing written, a spent refresh token is refused, and being
 offline or rate limited both switch through.
+
+# Fresh regression evidence (2026-10-09)
+
+- Selecting the already active registration now synchronizes that UUID from the
+  live file before verifying it, so a refresh token rotated naturally by Codex
+  is not spent again from the older snapshot. A deterministic test reproduced
+  the stale-token refusal before the fix and passes afterwards.
+- Renewed `last_refresh` values now use UTC RFC 3339 (`Z`), matching Codex's
+  timestamp type. The previous naive Python timestamp lacked a timezone.
+- Provider rejection codes are shown as bounded explanations, never raw bodies,
+  with `a` as the recovery action; users are no longer told to create another
+  duplicate registration with `save`.
+- Multiple registrations with the same display name now show UTC save times.
+  This makes a fresh registration distinguishable without displaying secret data.
+- No real account renewal, sign-in or authenticated network probe was performed
+  during this investigation. Current/saved session differences were established
+  by local comparisons only; revocation of a particular user's grant still
+  requires provider evidence or the user completing an official reauthentication.
+
+`python3 -B test_switcher.py` includes registration/renewal regressions.
+`ACCOUNT_HUB_TEST_REAL_CODEX=1 python3 -B -m unittest
+ test_codex_login.RealCodexLogin.test_native_login_revokes_existing_store_but_plugin_login_preserves_it`
+exercises the official CLI with dummy credentials, a local revocation fixture
+and blocked external connections.

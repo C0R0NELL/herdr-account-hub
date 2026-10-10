@@ -46,6 +46,9 @@ class AccountRecords(unittest.TestCase):
             def present(self):
                 return True
 
+            def prepare_switch(self):
+                return None  # This fixture models credentials, never a real daemon.
+
             def read_live(self):
                 return copy.deepcopy(self.store)
 
@@ -65,7 +68,6 @@ class AccountRecords(unittest.TestCase):
 
         self.backend = MemoryCodex()
         S.BACKENDS = {"codex": self.backend, "claude": EmptyBackend()}
-        S.stamp_badges = lambda: None
         S.notify = lambda *a: None
         S.proven_payload = lambda kind, profile: profile["payload"]
         S.fetch_usage = lambda *a: self.fail("a credential test reached HTTP")
@@ -76,12 +78,12 @@ class AccountRecords(unittest.TestCase):
         self.temp.cleanup()
 
     def register(self, payload=None, label="Work"):
+        """Create an explicit UUID fixture, as the Add new flow does."""
         self.backend.store = payload or login()
-        before = {p.get("id") for p in self.S.list_profiles("codex")}
-        self.S.save_live("codex", label)
-        new = [p for p in self.S.list_profiles("codex") if p.get("id") not in before]
-        self.assertEqual(len(new), 1, "each registration must append one record")
-        return new[0]
+        profile = self.S.make_profile("codex", label, self.backend.read_live())
+        self.S.write_profile(profile)
+        self.S._select_profile("codex", profile["id"])
+        return self.S.get_profile("codex", profile["id"])
 
     def test_three_people_in_one_workspace_have_independent_credentials(self):
         for user in ("one", "two", "three"):
@@ -101,7 +103,68 @@ class AccountRecords(unittest.TestCase):
                 profile["identity"]["user_id"] + "-session"))
         self.assertEqual(Path(self.S.PROFILES_DIR).stat().st_mode & 0o777, 0o700)
 
-    def test_registering_the_same_identity_twice_always_appends(self):
+    def test_save_existing_account_is_a_noop_even_with_another_label(self):
+        self.backend.store = login()
+        self.S.save_live("codex", "Work")
+        files = {path: path.read_bytes() for path in Path(self.temp.name).rglob("*.json")}
+        message = self.S.save_live("codex", "Another name")
+        self.assertEqual(message, "Account already saved")
+        self.assertEqual({path: path.read_bytes() for path in Path(self.temp.name).rglob("*.json")}, files)
+        self.assertEqual(self.backend.writes, 0)
+
+    def test_save_fresh_login_does_not_replace_revoked_saved_registration(self):
+        profile = self.register()
+        key = "codex:" + profile["id"]
+        self.S._record_login_problem(key, "saved login revoked", profile["payload"])
+        self.backend.store = login(credential="fresh", session="new-session")
+        files = {path: path.read_bytes() for path in Path(self.temp.name).rglob("*.json")}
+        self.assertEqual(self.S.save_live("codex"), "Account already saved")
+        self.assertEqual({path: path.read_bytes() for path in Path(self.temp.name).rglob("*.json")}, files)
+        self.assertEqual(self.S._usage_cache()[key]["login_problem"], "saved login revoked")
+        self.assertEqual(self.backend.writes, 0)
+
+    def test_workspace_without_person_metadata_cannot_identify_duplicates(self):
+        for token in ("first", "second", "second"):
+            self.backend.store = {"auth": {"tokens": {
+                "account_id": "shared-team", "access_token": token,
+                "refresh_token": token + "-refresh"}}}
+            self.S.save_live("codex")
+        self.assertEqual(len(self.S.list_profiles("codex")), 2)
+
+    @unittest.skipUnless(hasattr(os, "fork"), "process isolation requires fork")
+    def test_concurrent_manual_saves_create_only_one_registration(self):
+        self.backend.store = login()
+        read_fd, write_fd = os.pipe()
+        children = []
+        try:
+            for _ in range(2):
+                pid = os.fork()
+                if pid == 0:
+                    os.close(write_fd)
+                    os.read(read_fd, 1)
+                    try:
+                        self.S.save_live("codex")
+                    except BaseException:
+                        os._exit(1)
+                    os._exit(0)
+                children.append(pid)
+            os.close(read_fd)
+            read_fd = None
+            os.write(write_fd, b"xx")
+            os.close(write_fd)
+            write_fd = None
+            statuses = [os.waitpid(pid, 0)[1] for pid in children]
+            children.clear()
+            self.assertEqual(statuses, [0, 0])
+            self.assertEqual(len(self.S.list_profiles("codex")), 1)
+        finally:
+            for fd in (read_fd, write_fd):
+                if fd is not None:
+                    os.close(fd)
+            for pid in children:
+                os.waitpid(pid, 0)
+
+    def test_explicit_registrations_of_same_identity_keep_independent_uuids(self):
         first = self.register()
         second = self.register()
         self.assertNotEqual(first["id"], second["id"])
@@ -261,6 +324,16 @@ class AccountRecords(unittest.TestCase):
         uuid.UUID(first["id"])
         self.assertEqual(path.read_bytes(), before)
         self.assertEqual(list(directory.iterdir()), [path])
+
+    def test_plain_status_stays_a_silent_scriptable_diagnostic(self):
+        profile = self.register()
+        output = io.StringIO()
+        with patch.object(self.S, "codex_application_status", return_value="ready for new chats"), \
+                patch.object(self.S, "notify") as notify, contextlib.redirect_stdout(output):
+            code = self.S.cmd_status([])
+        self.assertEqual(code, 0)
+        notify.assert_not_called()
+        self.assertIn(profile["id"], output.getvalue())
 
 
 class PluginNamespace(unittest.TestCase):

@@ -13,9 +13,9 @@ shared by several people. A regression with three fictitious users, distinct
 emails and credentials, and one workspace produced one saved profile instead
 of three before the change. No real login was read or changed by the regression.
 
-The requested registration contract also permits registering the same identity
-twice. Consequently, using the provider user ID, email, or user/workspace pair
-as the catalog key would still violate that contract.
+The explicit Add new registration flow also permits registering the same
+identity twice. Consequently, using the provider user ID, email, or
+user/workspace pair as the catalog key would still violate that contract.
 
 # Solution
 
@@ -34,6 +34,26 @@ otherwise the user must explicitly capture the login.
 Existing profile files are read in place using stable UUIDs derived from local
 filenames, without rewriting credentials on read or migrating conversation
 history. Their filename remains unchanged when normal operations persist the ID.
+
+## Manual save behavior (2026-10-10)
+
+The user approved making **s** and the Save action ignore an account that is
+already registered. The person/workspace comparison only decides whether to
+skip a duplicate manual snapshot; it never chooses or replaces an existing
+UUID. The picker displays `Account already saved` before asking for a name,
+and `save_live` rechecks under the shared lock to serialize concurrent saves.
+
+For Codex, a workspace without person metadata cannot establish a match;
+only an identical snapshot permits skipping in that case. Different people
+sharing a workspace remain separate. A new grant for an already saved person
+also produces a message only, preserving credentials and refusal warnings;
+recovery uses **a** against the explicit registration UUID. Explicit **u** sign-in
+continues to create a new UUID, leaving any existing registration untouched.
+
+This was established with fictitious credentials: repeated manual saves,
+fresh login versus revoked snapshot, two concurrent save processes, missing
+person metadata, and Codex/Claude picker actions. The staged Codex login test
+also verifies that explicit Add new can register the same person independently.
 
 # Verification and limits
 

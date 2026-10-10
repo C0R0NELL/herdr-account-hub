@@ -4,60 +4,135 @@ Account Hub is an independent fork of
 [herdr-account-switch](https://github.com/rcosteira79/herdr-account-switch).
 Its plugin ID is `c0r0nell.account-hub`; the original remains
 `rcosteira.account-switch`. Both can be registered at the same time, with
-separate profile, selection, cache and backup directories. They still operate
-on the same machine-wide Claude Code and Codex credential stores.
+separate profile, selection, cache and backup directories. Account Hub can
+use the same Codex credential store when an account is applied; their saved
+registrations remain independent.
 
 Account Hub keeps its private files in `.local/` inside its own checkout.
 It uses `ACCOUNT_HUB_` settings and does not use the original plugin's settings
 or Herdr's shared plugin state/config directories.
 
-Hot-swap Claude Code / Codex logins from inside [herdr](https://herdr.dev),
-without logging out and back in. For the case: your main account hits its
-window at 11am, you have a second one, and you don't want to re-auth in a
-browser to use it — or to find out three panes later which account the fleet
-has been billing.
-
-> **Tested with Claude Code and the Codex CLI only.** Those are the two
-> credential stores it knows how to read, back up and write, and it has a
-> backend for each. No other harness is supported: adding one means teaching it
-> that harness's store, not configuring it.
+Select saved Claude Code / Codex accounts inside [Herdr](https://herdr.dev).
+For Codex, select an account, press **Enter**, and confirm with **Enter**. The
+account applies to this machine's Codex home and open chats reload automatically.
 
 ## What it does
 
-- **Named profiles** per agent kind. A profile is a snapshot of the credential
-  store the CLI actually reads, identified by its own local UUID. Every save
-  creates a new record, even for the same email, provider identity or workspace.
-  Three people in the same Team workspace remain three independent records.
-- **Switch** from an overlay picker, or cycle to the next account with one
-  keybinding — no UI, no prompt.
-- Both CLIs re-read their credential store on every request, so **agents that
-  are already running switch too**, from their next turn. Nothing to restart.
-- A **`$acct` badge** on every claude/codex pane naming the account in use, so
-  the sidebar answers "which account is this burning" at a glance. It appears as
-  soon as one profile is saved: `👤 work` for a saved login, `👤 work*` for a
-  login no profile has a copy of, `👤 logged out` for none.
+- **Independent registrations** use a local UUID. Adding an account creates a
+  new record, even when email, provider identity or Team workspace are the same.
+  Saving the current login does not duplicate an already registered account.
+- **One Codex account for this machine.** The picker writes the selected login
+  to `auth.json` and runs the official `codex app-server daemon restart` command.
+  The fresh daemon loads authentication without the old in-memory cache; native
+  CLI clients reconnect to their existing chats. No conversation ID input,
+  special launch command, separate pane or per-chat account is required.
+- **Shared history** stays in `CODEX_HOME`, or `~/.codex` when unset. The existing
+  `CODEX_SQLITE_HOME` and configured `sqlite_home` stay in effect. Switching does
+  not copy rollouts, rebuild databases, create account-specific homes, fork
+  conversations or rename threads.
+- **Verified application.** Account Hub checks the restarted server's account
+  with `account/read`, waits for previously loaded chats to return and checks
+  their IDs, custom titles and working directories. It reports success only
+  after confirmation. On failure it attempts to restore the previous login and
+  reload that account, reporting explicitly when recovery cannot be confirmed.
+- **Natural token renewal.** Codex continues managing its ordinary saved OAuth
+  login and renewal. Account Hub does not replace it with an external token
+  provider or keep another authentication server running.
 
-### No daemon
+### Scope and requirements
 
-Unlike the other plugins here, this one is pure action — nothing runs in the
-background. Credentials only change when you press a key, so there is nothing
-to react to. The cost is that the `$acct` badge is refreshed at the moments the
-plugin runs (a switch, a save, herdr startup, while the picker is open) rather
-than continuously; a pane opened after the last switch shows no badge until the
-next one. That is the whole trade, and it beats a daemon polling forever to
-restate a value that changes twice a day.
+Requires Python 3.11 or newer and Herdr 0.8.0 or newer. Claude Code support is
+beta; its registration tests use fictitious credentials, not a real Claude account.
+
+Automatic reload requires **Codex CLI and daemon 0.162.0 or newer**, using the
+managed local daemon and the default OpenAI provider. This covers ordinary
+`codex` and `codex resume` terminals sharing the selected `CODEX_HOME`.
+Different users, other Codex homes, remote servers and embedded `--no-daemon`
+executions are outside that shared daemon's scope.
+
+The credential backend must be `cli_auth_credentials_store = "file"` (the
+Codex default). Keyring/ephemeral credentials and custom model providers are
+refused before overwriting the file. If the daemon is not running, the plugin
+installs the selected login for future chats and does not start a daemon.
+A failed passive probe is never treated as success.
+
+The official restart may wait for running work during Codex's configured
+shutdown grace period. In Codex 0.162.0, `shutdownGraceSeconds` in
+`$CODEX_HOME/app-server-daemon/settings.json` defaults to 60 seconds and accepts
+0–300 seconds. If the daemon is still busy at the deadline, Codex forces it to
+stop; an unfinished task or compaction can be interrupted. The picker explains
+that the daemon waits for active work. Reload and verification can take
+additional time. Account Hub reads this setting without changing it. The switch
+uses the installed CLI's lifecycle commands and the
+[official app-server protocol](https://learn.chatgpt.com/docs/app-server).
+The Unix WebSocket transport is documented as experimental; Account Hub checks
+compatibility and never silently falls back to changing disk credentials only.
 
 ## Install
 
 ```sh
-gh repo clone C0R0NELL/account-hub ~/.local/share/herdr/plugins/account-hub
-herdr plugin link ~/.local/share/herdr/plugins/account-hub
+herdr plugin install C0R0NELL/account-hub
 ```
 
-This repository is private, so cloning requires GitHub access. A development
-checkout can also be linked with `herdr plugin link /path/to/account-hub`.
-Pull code updates into the linked checkout and close/reopen an existing picker.
-Re-run `herdr plugin link` when the manifest changes.
+Herdr downloads the repository into its managed GitHub plugin directory and
+registers the root `herdr-plugin.toml`. The plugin uses that checkout's location;
+it does not create or require a `GITHUB_REPOSITORIOS` directory. This repository
+is currently private, so Git must be authenticated with an account that has
+access. The same install command applies if the repository is made public.
+
+To see the actual install directory on your machine:
+
+```sh
+herdr plugin list --plugin c0r0nell.account-hub --json
+```
+
+The response's `plugin_root` is the directory containing the code and `.local/`
+private data. Herdr replaces managed checkouts on reinstall and removes them on
+uninstall. Back up `.local/` before either operation, then restore it into the
+new checkout after reinstalling. Never commit that backup.
+
+### Local development
+
+Developers can keep their clone anywhere and register it directly:
+
+```sh
+git clone https://github.com/C0R0NELL/account-hub.git /path/to/account-hub
+herdr plugin link /path/to/account-hub
+cd /path/to/account-hub
+python3 -B test_switcher.py
+```
+
+Edit the linked checkout and close/reopen an existing picker to test Python
+changes before committing. No push, pull, or copy to another checkout is needed.
+Re-run `herdr plugin link /path/to/account-hub` when the manifest changes.
+Linking is a local developer choice; other users continue to use `plugin install`.
+
+To give development its own entry in the plugin manager, run this from the
+checkout with Python 3.11 or newer:
+
+```sh
+python3 scripts/link-dev.py
+```
+
+This generates and links `herdr-plugin.dev.toml`, ignored by Git, with the name
+`dev-account-hub` and ID `c0r0nell.dev-account-hub`. It executes this checkout's
+code and keeps its private data in this checkout's `.local/`. The official
+`herdr-plugin.toml` keeps the name `Account Hub` and ID `c0r0nell.account-hub`
+for commits and GitHub installations. Re-run the helper when the official
+manifest changes; Python code changes are used when you reopen the picker.
+Use `c0r0nell.dev-account-hub.open` for a development picker keybinding.
+
+If this checkout was previously linked with the official ID, first link the
+development entry, update any keybindings to its ID, and then run
+`herdr plugin unlink c0r0nell.account-hub` to unregister the old local entry.
+Keep any separately installed GitHub version registered: the two IDs can coexist.
+
+Herdr refuses a GitHub install over a locally linked plugin. To return to a
+managed installation, use `herdr plugin unlink c0r0nell.account-hub`, then the
+install command above. Unlink leaves the development checkout and its data alone;
+the managed installation starts with its own `.local/` directory.
+
+### Save accounts
 
 Then, with the account you use most logged in:
 
@@ -65,176 +140,96 @@ Then, with the account you use most logged in:
 herdr plugin action invoke save --plugin c0r0nell.account-hub
 ```
 
-That snapshots whatever is logged in right now. Log into the other account the
-normal way (`claude` → `/login`, or `codex login`), run `save` again, and you
-have two profiles to switch between.
+That saves the current login if its person/workspace is not already registered.
+Pressing **s** for an existing account shows `Account already saved`, without
+prompting for a name, creating a duplicate or replacing saved credentials.
+To recover a revoked registration, select it and use **a** to sign in again;
+saving the current login does not repair revocation.
+
+To add an account, press **u** in the picker,
+choose **Codex** or **Claude (beta)** with the arrow keys, and press Enter. Supply
+an optional label in **Name** and confirm with Enter to start the official sign-in.
+The plugin saves the completed login as a new UUID automatically; no separate
+**s** is needed.
+The currently active account and chat history stay in place until you apply a
+registration with Enter. **c** remains a compatibility shortcut for adding Codex.
+
+Codex uses its official device-code sign-in in an empty temporary credential
+folder. Claude uses `claude auth login --claudeai` with a temporary
+`CLAUDE_CONFIG_DIR`, following its [documented configuration-directory
+isolation](https://code.claude.com/docs/en/authentication#log-in-with-multiple-accounts).
+Claude automatic registration is beta, tested with fictitious file credentials,
+and currently unavailable on macOS because its directory-scoped Keychain
+capture is not implemented. Existing Claude logins can still be saved with **s**.
+
+Both sign-in flows return to the picker when the official CLI exits. Follow the
+CLI's displayed URL/code instructions; Ctrl+C cancels, and the plugin stops the
+sign-in after 15 minutes. Canceling any dialog with Esc starts no login. Failed,
+canceled or timed-out sign-ins create no registration and discard the temporary
+credential folder. The native flow may impose a shorter expiry of its own.
+
+Do not run successive `codex login` commands in the shared home to collect
+accounts. In Codex 0.162.0, starting that command revokes the existing OAuth
+login before the new sign-in, so a previously saved copy may stop working.
+Saving an auth file does not protect its grant from server-side revocation.
+
+To reauthenticate an existing Codex registration, select it and press **a**,
+then confirm. Sign in to the same person and workspace; a mismatched login is
+refused without replacing that registration. After sign-in, **Enter** applies
+the account through the ordinary machine-wide switch. If device login is not
+available for your workspace, set `codex_login_method = "browser"` in the
+plugin config to use the official browser flow instead.
+
+The corresponding terminal commands are:
+
+```sh
+python3 /path/to/account-hub/switcher.py codex-login --label Work
+python3 /path/to/account-hub/switcher.py codex-login PROFILE_UUID
+# Use the official browser flow when device auth is unavailable:
+python3 /path/to/account-hub/switcher.py codex-login PROFILE_UUID --browser
+```
+
+The temporary folder is discarded after sign-in. The plugin retains credentials
+only in `.local/profiles/codex/` or `.local/profiles/claude/`. It never opens chats
+in those temporary homes.
 
 The selected profile is stored by UUID, separately from its credentials. Email,
 user ID and workspace ID are metadata, never keys for replacing a registration.
-Duplicate names are allowed; use the UUID printed by `save`, `status` or `list`
+Duplicate names are allowed; the picker shows the UTC save time to distinguish
+them. Scripted commands can use the UUID printed by `save`, `status` or `list`
 when a name is ambiguous. Renaming keeps the UUID and credential file unchanged.
 
-### Config (`~/.config/herdr/config.toml`)
+### Switch the Codex account
 
-**1. Show the badge.** `$acct` is a pane token, and a token renders only if a
-sidebar row names it. Installing a plugin does not edit your config, so until
-some row names `$acct`, the badge is invisible and herdr reports no error. The
-`enable-badge` action does that one edit for you:
+Open Account Hub from Herdr's plugin manager. Select the saved Codex account and
+press **Enter**. A centered dialog asks:
+
+```text
+Switch Codex account
+Switch to Work ?
+Reload open chats; keep history and titles.
+enter | esc
+```
+
+Press **Enter** to apply, or **Esc** to cancel without changing anything.
+After the success message, return to your existing chat. Its native Codex
+interface reconnects to the restarted daemon using the same conversation.
+All chats on that shared daemon use the selected account for subsequent work.
+
+The scriptable command performs the same machine-wide transaction without an
+interactive confirmation:
 
 ```sh
-herdr plugin action invoke enable-badge --plugin c0r0nell.account-hub
+python3 /path/to/account-hub/switcher.py switch codex PROFILE_UUID
 ```
 
-It backs `config.toml` up first, merges `$acct` into the rows you already have
-(and into any `rows_by_agent` override for claude/codex, since an override
-replaces `rows` rather than extending it), then reloads the server. Run it
-twice and the second run does nothing. To do it by hand instead:
+The UUID identifies a saved account, not a conversation. A unique profile label
+also works. The picker supplies it automatically; you do not need to copy IDs.
+The `next` action cycles the machine's account through the same verified flow.
 
-```toml
-[ui.sidebar.agents]
-rows = [["state_icon", "workspace", "tab", "$acct"], ["agent"]]
-```
+### Keybindings (`~/.config/herdr/config.toml`)
 
-The `stamp` action checks this at startup and posts one notification if the
-token is unreferenced. It never edits the config on its own — that only happens
-when you invoke `enable-badge`. It touches the sidebar row only — it does not
-add, remove or switch accounts. That is the picker, under `open`.
-
-#### Where to show it
-
-The account is the same on every pane of a kind, so there are three places to
-put it and they are not exclusive. All three read the same value.
-
-| where | how | scope |
-|-------|-----|-------|
-| sidebar, per pane | `$acct` token, via `enable-badge` | one badge per agent row |
-| herdr tab bar | `tab_bar_right` command entry | one badge for the whole session |
-| Claude Code status line | ccstatusline `custom-command` widget | one badge per Claude pane |
-
-#### One badge instead of one per pane
-
-Credentials are machine-wide per kind, so every claude pane shows the same
-account and the sidebar repeats itself down the column. To state it once, put it
-in the tab bar instead and turn the pane token off:
-
-```toml
-[ui]
-tab_bar_right = [
-  { type = "command", command = "python3 ~/.local/share/herdr/plugins/account-hub/.local/current/switcher.py badge claude", interval_seconds = 30, timeout_seconds = 5 },
-  { type = "text", text = "  " },
-]
-tab_bar_right_separator = ""
-```
-
-The last item on the tab bar sits flush against the right edge, which reads as
-cramped. A whitespace-only `text` entry after the badge is the inset — herdr
-keeps it. Blank `tab_bar_right_separator` when you add one, or the default ` · `
-lands between the badge and the inset. Drop both lines if you want the badge
-hard against the edge.
-
-That path uses `.local/current`, a symlink inside this checkout that points
-back to the plugin's code. If you link the checkout at a different location,
-adjust the command to that location. `herdr plugin list --plugin
-c0r0nell.account-hub --json` reports the linked directory.
-
-The `badge` command prints one line and exits — herdr re-runs it on the
-interval, so this needs no daemon and no `[[startup]]` hook. It reads the
-credential store and the plugin's usage cache, then starts a background usage
-refresh if one is due. Naming a kind
-(`badge claude`) prints that kind alone; `badge` with no argument prints every
-kind it can name, each prefixed with the agent's name:
-
-```
-Claude 👤 work 42% · Codex 👤 spare 18%
-```
-
-The percentage is usage consumed in the current five-hour session, even when
-weekly or model-specific limits such as Fable are exhausted. It appears after
-the account name when a cached session reading exists;
-`~42%` marks an old reading or a reporting cooldown. While herdr polls the badge,
-it refreshes the active account's usage every two minutes by default, respecting
-provider cooldowns. Set `usage_ttl_s = 300` for five minutes, or use
-`ACCOUNT_HUB_USAGE_TTL_S=300` in the command. New readings appear on the next
-tab-bar poll (30 seconds in the example above). Background requests keep slow
-responses from delaying the badge; failed reads retain the last percentage.
-Without a reading, the badge shows only the account name until a refresh succeeds.
-The picker, usage panel, and switch checks share the same cache.
-
-The badge cannot vary per pane or per tab, and that is not a limitation of the
-badge. A credential store is machine-wide per agent, so every claude pane bills
-to the same account; a per-pane badge would print the same value on each one.
-Printing both accounts once, on the tab bar, says everything there is to say.
-
-Set `ACCOUNT_HUB_BADGE=0` in herdr's environment to stop stamping panes once
-the tab bar shows it, or keep both — they read the same value.
-
-#### In ccstatusline instead
-
-[ccstatusline](https://github.com/sirmalloc/ccstatusline) drives the Claude Code
-status line, and its **Custom Command** widget runs a shell command and shows
-the output — the same one-line `badge` command, no herdr involved:
-
-```json
-{
-  "type": "custom-command",
-  "commandPath": "python3 ~/.local/share/herdr/plugins/account-hub/.local/current/switcher.py badge claude",
-  "timeout": 2000
-}
-```
-
-Add it through `ccstatusline`'s editor (Custom → Custom Command) rather than by
-hand, so the widget gets an `id`. The widget also takes `maxWidth` to truncate
-and `preserveColors` to keep ANSI colour from the command.
-
-This works because `badge` needs nothing from herdr: it reads the credential
-store, prints one line and exits. It runs the same from a herdr action, a bare
-shell, or a Claude Code status line. Only the pane and workspace badges talk to
-the herdr socket.
-
-The trade is scope. The status line lives inside one Claude pane, so it names
-the account for that pane's CLI — which is the same account everywhere, stated
-once per pane rather than once per session. Pick the tab bar if you want it
-stated exactly once.
-
-#### Choosing the badge
-
-`ACCOUNT_HUB_GLYPH` picks the character, and `ACCOUNT_HUB_BADGE_FORMAT`
-decides what goes around it. Both fields are optional, so the format doubles as
-a way to show less:
-
-| format | shows |
-|--------|-------|
-| `{glyph} {name}` (default) | `👤 work` |
-| `{glyph}{name}` | `👤work` — no space |
-| `{glyph}` | `👤` — badge only, no account name |
-| `{name}` | `work` — no glyph |
-| `{agent} - {name}` | `Claude - work` — the agent's short name |
-| `{title}: {name}` | `Claude Code: work` — its full name |
-
-`{agent}` and `{title}` earn their place when the badge names two accounts at
-once. A format that uses either one already says which agent it is, so the
-automatic prefix steps aside. With `separator` set to three spaces:
-
-```toml
-badge_format = "{agent} - {name}"
-separator = "   "
-```
-
-```
-Claude - work   Codex - spare
-```
-
-A format naming a field that does not exist falls back to the default rather
-than blanking the badge.
-
-For a `tab_bar_right` entry, set them inline on the command — that env is yours
-to write, unlike the one herdr hands to plugin actions:
-
-```toml
-command = "ACCOUNT_HUB_GLYPH=🔑 python3 ~/.local/share/herdr/plugins/account-hub/.local/current/switcher.py badge claude"
-```
-
-**2. Keybindings** — `herdr server reload-config` after editing these:
+Run `herdr server reload-config` after editing these:
 
 ```toml
 [[keys.command]]
@@ -258,34 +253,91 @@ reports where the plugin is installed:
 [[keys.command]]
 key = "prefix+1"
 type = "shell"
-command = "python3 ~/.local/share/herdr/plugins/account-hub/.local/current/switcher.py switch claude work"
+command = "python3 /path/to/account-hub/switcher.py switch claude work"
 ```
 
-## Usage
+## Account details
 
-What is left on every account you have saved, both agent kinds, in one panel:
-
-```sh
-herdr plugin action invoke usage --plugin c0r0nell.account-hub
-```
+Open the account picker and press **d** to expand the usage windows for every
+saved account. Codex appears first, followed by Claude Code (beta). This is the
+single usage view in Herdr's plugin menu; there is no separate Usage action.
 
 ```
-Claude Code
+Codex
+  ● main          Session    42%  ████░░░░░░  limit in 1h30 (resets in 2h)
+                  Weekly     18%  ██░░░░░░░░  ~34% left (resets in 4d01h)
+Claude Code (beta)
   ● main          Session    16%  ██░░░░░░░░  limit in 2h10 (resets in 10m)
                   Weekly     65%  ███████░░░  limit in 1d12h (resets in 4d02h)
                   Fable       6%  █░░░░░░░░░  ~88% left (resets in 4d02h)
     spare         Session     0%  ░░░░░░░░░░  —
                   Weekly      2%  ░░░░░░░░░░  ~92% left (resets in 5d07h)
-Codex
-  ● main          Weekly     42%  ████░░░░░░  ~34% left (resets in 4d01h)
 ```
 
-`●` is the account that is live. The point of listing the others is the case
-above: `main` runs out before its session renews, and `spare` has room now.
+In the picker, `●` identifies the credential store's selected login.
+`list.active` has the same scope (`active_source = "credential_store"`).
+The terminal diagnostic `python3 switcher.py status` also shows the reload
+confirmation. The point of
+listing the others is the case above: `main` runs out before its session renews,
+and `spare` has room now.
 
-`r` re-reads, `q` closes. `switcher.py usage` prints the same thing as text
-(`--color` for ANSI, `--json` for a machine to read); neither prints a
-credential.
+**r** refreshes the accounts and usage, **d** returns to the compact view, and
+**Esc** closes the picker.
+
+Opening the picker requests fresh usage and reset counts, even when its cache
+is recent. While it stays open, it checks the account list and redraws every
+five seconds, and refreshes usage every two minutes by default (`usage_ttl_s`).
+Press **r** for an immediate usage refresh. Opening, automatic and manual reads
+all respect provider cooldowns.
+
+### Earned Codex resets
+
+Codex rows have a second column to the right of usage: `3 resets`. The count
+comes from the same account-specific usage response and shares its refresh
+interval. `-` means the service has not supplied a valid count or the account's
+API read failed. Counts use `0 reset`, `1 reset`, and `2 resets` or more.
+`~3 resets` marks an aged reading without a reported API error. Claude rows
+leave this column empty.
+
+Select an account with the arrow keys and press **t** (next to **u** in the
+help line). The plugin fetches that account's reset details and chooses the
+available reset with the nearest expiry, randomly selecting among ties.
+Expired, redeeming and unsupported reset types are excluded. Dated credits
+are considered before credits whose expiry is not provided. If the service
+caps the details so the earliest expiry cannot be determined, no reset is used.
+
+```text
+Use reset
+Use a reset for Work ?
+Expires: 2026-10-22 19:09 UTC
+enter | esc
+```
+
+Enter consumes the selected reset; Esc cancels. This uses the selected
+registration's credentials without switching the machine's active account or
+restarting chats. The plugin then reads the provider's usage and reset count
+again, rather than assuming that usage became zero or decrementing a count.
+After a successful reset it also schedules up to three additional usage reads
+for that registration, bypassing the normal two-minute cache interval. The
+picker runs these on its existing idle ticks: a response that still contains
+the old quota, or only one updated window, does not require pressing **r**.
+The follow-ups respect provider cooldowns and never repeat the consumption.
+The provider can return `nothing_to_reset` or `no_credit`; these are shown as
+no reset used. An `applicable_available_count` hint does not block the attempt.
+
+An operation UUID is saved in `.local/reset-attempts.json` **before** sending a
+consumption request. If its response is lost, pressing **t** again offers the
+same credit with the same operation UUID, including after closing/reopening
+the picker. This follows the official idempotency rule and prevents a retry
+from spending a second credit. Concurrent confirmations for the same
+registration are serialized; a stale confirmation must check again.
+
+The capability and outcomes are documented in the official
+[Codex app-server documentation](https://learn.chatgpt.com/docs/app-server).
+Account Hub uses the authenticated HTTP routes implemented by the official
+[Codex 0.162.0 backend client](https://github.com/openai/codex/blob/rust-v0.162.0/codex-rs/backend-client/src/client/rate_limit_resets.rs),
+alongside its existing usage reader. These HTTP routes are an internal Codex
+contract and may change between versions.
 
 ### Where the numbers come from
 
@@ -343,13 +395,16 @@ The overlay and the `--color` text form read the same palette, so they agree.
 
 ```
 j / k or ↓ / ↑   move selection
-enter            switch to the selected account
-s                save the current login as a new profile (prompts for a name)
-a                capture the current CLI login into the selected profile (confirms)
-r                rename the selected profile
+enter            switch account (Codex: centered Enter/Esc confirmation, then global reload)
+c                compatibility shortcut: add a Codex account
+s                save current acc (already saved: message only; new: asks for a name)
+a                sign in again to selected Codex account / capture current Claude login (confirms)
+r                refresh the whole account list and every account's usage
+g                rename the selected profile
 x                delete the selected profile, including the one in use
 d                show / hide every usage window, not just the short one
-u                re-read usage
+u                add new: choose Codex / Claude (beta), then sign in and save automatically
+t                use selected Codex account's earliest-expiring earned reset (Enter/Esc confirms)
 q / esc          close
 ```
 
@@ -357,9 +412,8 @@ Each account carries how much of it is left, so the picker answers "which one
 should I switch to" on its own:
 
 ```
-       account               used limit in
- ● main             █████░░░  66% 1h32   you@example.com · max
-   spare            ░░░░░░░░   2% 4h47↺  you@work.example · team
+ ● main             █████░░░  66% 2h00↺  you@example.com | max
+   spare            ░░░░░░░░   2% 4h47↺  you@work.example | team
 ```
 
 That column is the **short** window — the session one, five hours on both
@@ -375,51 +429,44 @@ days left while its session sat at 69%.
 One exception. A **spent** window takes the column, because once one is full the
 account is blocked and that outranks how the session is doing.
 
-While the shown window is filling, the figure counts down to when it fills —
-`1h32` above is when work stops on `main`, not when its session refills two
-hours from now. That is what the column is titled for.
-
-Not every window has a limit still ahead of it, though. A **spent** one has
-arrived at it, one too new has no rate to project from, one being spent slowly
-enough never reaches it before it resets, and a cached reading can hold a limit
-the clock has already gone past. `spare` above is the second of those: 2% spent,
-and not yet running long enough to say what that means.
-
-Those rows show the reset instead, and carry a `↺`. Without it a reset reads as
-a limit that is not coming, which is what the column said for every row before.
+The compact countdown always shows the selected window's automatic reset and
+carries `↺`: `2h00↺` means that window renews in two hours. If the provider has
+not supplied a reset time, it shows `—`. Estimated exhaustion times (`limit in`)
+appear only in the detailed view opened with `d`.
 
 Every window is still there — `d` swaps the column for all of them, each with its
 own projection, one account per block:
 
 ```
-       account       window   used              at this rate
 Claude Code
- ● main                                  you@example.com · max
+ ● main                                  you@example.com | max
                     Session    11%  █░░░░░░░░░  ~77% left (resets in 2h37)
                     Weekly     66%  ███████░░░  limit in 1d13h (resets in 3d23h)
                     Fable       7%  █░░░░░░░░░  ~84% left (resets in 3d23h)
 
-   spare                                 you@work.example · team
+   spare                                 you@work.example | team
                     Session     0%  ░░░░░░░░░░  —
                     Weekly      2%  ░░░░░░░░░░  ~92% left (resets in 5d04h)
                     Fable       0%  ░░░░░░░░░░  —
 
 Codex
- ● main                                  you@example.com · plus
+ ● main                                  you@example.com | plus
                     Weekly     66%  ███████░░░  limit in 1d13h (resets in 3d23h)
 ```
 
 The account line drops its own figure while expanded, because the windows below
-already carry it. Both views carry column titles.
+already carry it. The picker omits column titles and uses `|` between hints and
+identity fields.
 
 **Fable** is a per-model weekly limit. The API calls it `weekly_scoped` and puts
 the model in a `scope` field, so the model's name is shown instead of the key.
 
-**Codex shows only its weekly window.** It reports one worth watching; the rest
-is noise next to claude's three.
+**Codex shows every window the account reports**, including its five-hour and
+weekly limits when available. The compact row summarizes the shortest window,
+or a spent window if one is blocked; `d` shows the individual readings.
 
-**at this rate** is the column that decides whether to switch: where the window
-lands if you keep spending it as you have been. `~70% left` finishes with room
+The detailed view's projections show where the window lands if you keep
+spending it as you have been. `~70% left` finishes with room
 to spare; `limit in 1d13h (resets in 4d00h)` runs out three days early — 66%
 used is comfortable with a day to go and a problem with five. The reset comes
 along in brackets, because a projection means nothing without knowing what it is
@@ -430,27 +477,50 @@ so it says nothing until the window has run long enough to mean something: a
 window minutes old would otherwise claim the limit is imminent. A window already
 at 100% reads `spent`.
 
-The picker and usage panel refresh at the cache interval (two minutes by
-default), because the endpoints rate-limit. `u` in the picker or `r` in the
-usage panel requests a refresh. A successful switch verification also saves
-its usage reading, so opening the picker does not repeat that request.
+The picker requests a fresh read when opened, then refreshes at the cache
+interval (two minutes by default), because the endpoints rate-limit. `r`
+refreshes the entire picker and requests a fresh read even during that cache
+interval, while still respecting the provider's cooldown. Newly added
+registrations are read on the next picker tick. A successful switch verification
+also saves its usage reading for other cache-aware actions and UI ticks.
 
 If a read fails or ages past the cache lifetime, the picker keeps the bar and
 countdown and marks the last known percentage with `~` (for example, `~100%`).
-Press `d` to see the reading's age and refresh error. Refresh respects the
-cache lifetime and the provider's `Retry-After` delay, falling back to five
-minutes when no usable delay is supplied.
+Press `d` to see the reading's age and refresh error. A failed read keeps its
+warning on subsequent UI ticks until a successful read clears it. Automatic
+refresh while the picker stays open respects the cache lifetime, except for
+short follow-up checks after a reset; every refresh respects the provider's
+`Retry-After` delay, falling back to five minutes when no usable delay is supplied.
 
-`s`, `a`, `r` and `x` each open a dialog in the middle of the screen. Deleting removes
+An account with a known error has a red **!** to the left of its name, including
+when selected or expanded. This covers refused/revoked credentials, reporting
+failures and rate limits; **d** explains the reason. A successful read clears a
+temporary reporting error. A known refused saved login remains marked even if
+a different live login for that person can read usage, until those saved
+credentials change or verification of that saved login succeeds. A high usage
+percentage alone is not a login failure and does not show **!**.
+
+The picker shows the saved account count and scrolls with `j/k` or the arrow
+keys when the list or expanded readings exceed the pane height. Selection
+follows the registration UUID across list updates. Renewing credentials does
+not change the order of registrations.
+
+`s`, `a`, `g` and `x` each open a dialog in the middle of the screen. Deleting removes
 this plugin's saved copy of a login and nothing else: the credential store the
 CLI reads is never touched, so you stay logged in. Delete the profile for the
 account you are on and the next switch away re-saves it under an `autosaved-…`
 name.
 
-`●` marks the selected UUID whose login is live. A section header reading
-*"live: … (unsaved, press s)"* means the live login is not associated with a
-selected record. Press `s` to register it, or `a` on an existing record to
-explicitly replace that record's authentication.
+`●` marks the selected UUID whose saved login matches the live credential
+store. The header shows *"live: … (press 's' to save this account)"* only when
+the current person/workspace is absent from the saved accounts. A fresh login
+for an already registered account does not show that prompt. Usage reads can
+use that account's current live token without overwriting its saved registration
+or choosing among duplicate UUIDs.
+
+The section titles are `Codex` and `Claude Code (beta)`, in that order. Enter and confirmation
+apply the selected Codex account, reload the daemon and verify its account;
+the action reports the result.
 
 ## What it reads and writes
 
@@ -523,22 +593,15 @@ rather than take the `autosaved-…` name.
 
 Settings live inside the plugin's own checkout:
 
-```sh
-~/.local/share/herdr/plugins/account-hub/.local/config/config.toml
+```text
+<plugin-root>/.local/config/config.toml
 ```
 
 ```toml
-# The badge character on each agent pane and in the tab bar.
-glyph = "🔑"
-
-# What goes around it, from {glyph}, {name}, {agent} and {title}. Drop {name}
-# for a badge with no account name.
-badge_format = "{glyph}{name}"
-
 # Percent at which a usage window turns amber, then red.
 usage_thresholds = "50,75"
 
-# Usage refresh interval in seconds, including the top-right badge.
+# Usage refresh interval in seconds for the account picker.
 usage_ttl_s = 120
 
 # Override one colour of the four: ok, warn, crit, stale.
@@ -565,18 +628,12 @@ plugin's storage.
 
 An environment variable still wins over the file, but is rarely the practical
 choice: plugin actions inherit the **herdr server's** environment, so setting
-one means exporting it before herdr starts. The `tab_bar_right` and
-ccstatusline entries are the exception — those take variables inline on the
-command, which is why they are the easy place to restyle the badge.
+one means exporting it before herdr starts. For a direct script invocation,
+variables can be set inline on the command.
 
 | var | default | meaning |
 |-----|---------|---------|
 | `ACCOUNT_HUB_NOTIFY` | `1` | herdr notification on each switch, and on a refused one |
-| `ACCOUNT_HUB_BADGE` | `1` | write the `$acct` pane token |
-| `ACCOUNT_HUB_BADGE_ALWAYS` | `0` | badge a kind with no saved profile too |
-| `ACCOUNT_HUB_GLYPH` | `👤` | the badge character |
-| `ACCOUNT_HUB_BADGE_FORMAT` | `{glyph} {name}` | badge layout, from `{glyph}`, `{name}`, `{agent}`, `{title}`; any may be dropped |
-| `ACCOUNT_HUB_SEPARATOR` | ` · ` | between kinds, when `badge` prints more than one |
 | `ACCOUNT_HUB_VERIFY_SWITCH` | `1` | ask the provider whether a saved login still works before installing it |
 | `ACCOUNT_HUB_USAGE_RENEW` | `1` | renew a parked account's token so its usage can be read |
 | `ACCOUNT_HUB_USAGE_TTL_S` | `120` | how long a usage answer is reused |
@@ -584,6 +641,7 @@ command, which is why they are the easy place to restyle the badge.
 | `ACCOUNT_HUB_RENEW_MARGIN_S` | `300` | renew this far ahead of a token's expiry |
 | `ACCOUNT_HUB_COMMAND_TIMEOUT_S` | `30` | how long any one command may take before it is abandoned |
 | `ACCOUNT_HUB_LOCK_TIMEOUT_S` | `5` | how long to wait for another switch before refusing |
+| `ACCOUNT_HUB_CODEX_LOGIN_METHOD` | `device` | official Codex sign-in flow: `device` or `browser` |
 | `HERDR_BIN_PATH` | `herdr` | herdr binary (set by herdr when it invokes an action) |
 
 
@@ -603,8 +661,12 @@ still in common must also associate the live login with that record. If the
 association cannot be established, no registration is updated automatically.
 Other registrations remain untouched, including duplicates of the same identity.
 
-After an official CLI login, choose which record to update: select it in the
-picker and press `a`, or run:
+To sign in again to an existing Codex registration, select it and press `a`.
+This uses official sign-in in an empty temporary credential folder, preserving
+the currently active account until you press Enter to apply the result.
+
+If you have already completed a fresh external CLI login and want to capture
+that existing auth file into one specific registration, run:
 
 ```sh
 python3 switcher.py reauth codex <profile-uuid>
@@ -613,7 +675,8 @@ python3 switcher.py reauth codex <profile-uuid>
 This captures the current login into only that UUID, preserves its name and
 creation time, clears its old usage/staged tokens, and selects it. It does not
 launch login or change the live credential store. `reauth` rejects labels and
-requires an existing UUID. `save` always registers a new UUID instead.
+requires an existing UUID. `save` creates a UUID only for an account not already
+registered; an existing account produces `Account already saved`.
 
 A renewal counts as a change too: renewing a parked profile's tokens moves its
 `saved_at`, so anything watching that field can tell the credential was
@@ -624,22 +687,22 @@ sign of it: it still parses, still installs, and only fails when an agent uses
 it. Four provider rules cause that, and they are why everything under "Not
 losing a login" above works the way it does — refresh tokens are single-use and
 rotate, a refusal counts only when the provider words it, an upgraded account
-looks exactly like a revoked one, and Codex revocation is scoped to the
-`installation_id` inside `CODEX_HOME` rather than to the account.
+looks exactly like a revoked one, and starting a new Codex CLI login revokes the
+OAuth grant already stored in that home. Collect registrations using the
+plugin's empty temporary login store instead.
 
 Written up once, with the refusal codes and how each was established:
 [`docs/solutions/runtime-errors/saved-login-revoked-outside-the-plugin.md`](docs/solutions/runtime-errors/saved-login-revoked-outside-the-plugin.md).
 
 ### A refused switch says so
 
-The picker prints a refusal on its own status line. Every other path only wrote
-it to stderr, and herdr drops that. The failure then read as "the badge did not
-change", with nothing saying why.
+The picker prints a refusal on its own status line. Other account-changing
+actions also send the reason as a Herdr notification so failures remain visible
+when the command runs through a keybinding.
 
 `next`, `switch`, `save` and `reauth` send the reason as a herdr notification. A
 completed switch already sent one, so the two match. `ACCOUNT_HUB_NOTIFY=0`
-turns both off. Nothing polled sends one: `badge` runs once a second from the
-tab bar, and a notification per tick would be worse than the silence.
+turns both off. Polling commands such as `list` send no notifications.
 
 Where that notification appears is herdr's setting, not this plugin's.
 `[ui.toast] delivery = "system"` hands it to macOS, which drops it when the
@@ -649,19 +712,19 @@ needs no permission from macOS.
 ## Fragility
 
 Credential layouts are the agents' private business and can change without
-notice. If a switch stops taking, `herdr plugin action invoke status --plugin
-c0r0nell.account-hub` prints what each store currently reports; the store
+notice. If a switch stops taking, `python3 /path/to/account-hub/switcher.py status`
+prints what each store currently reports; the store
 paths and the shape read out of them are the two constants at the top of
 `ClaudeBackend` / `CodexBackend` in `switcher.py`.
 
-A Codex install that keeps its credentials in the macOS Keychain rather than
-`~/.codex/auth.json` is not supported — the plugin reports codex as not logged
-in rather than guessing.
+A Codex install that uses the OS keyring rather than `auth.json` is not
+supported. Account Hub refuses that switch before writing the file.
 
 ## Requirements
 
-- herdr ≥ 0.8.0 (for the `[[startup]]` badge refresh)
-- Python 3 (stdlib only; uses `curses` for the picker)
+- herdr ≥ 0.8.0
+- Python 3.11+ (stdlib only; uses `curses` for the picker)
+- Codex CLI and managed local daemon ≥ 0.162.0 for automatic Codex reload
 - macOS or Linux
 
 ## The other herdr plugins

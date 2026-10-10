@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Checks for the pre-switch liveness check and the badge format.
+"""Checks for account switching, renewal and usage reporting.
 
 Run with `python3 test_switcher.py`. Standard library only, same as the plugin.
 
@@ -115,7 +115,6 @@ def reset(target_payload=None):
     S.write_profile(S.make_profile(
         "claude", "Target",
         target_payload or claude_payload("TARGET", "old-access", "r1")))
-    S.stamp_badges = lambda *a, **k: None
     S.notify = lambda *a, **k: None
     return fake
 
@@ -352,151 +351,6 @@ check("with a reason the picker can print",
       bool(err) and "may be stuck" in err, str(err))
 check("and the live login was never touched", fake.store.get("who") == "LIVE")
 
-print("\nthe badge names the agent when it shows more than one account")
-S.BACKENDS["claude"] = S.ClaudeBackend()
-S.BACKENDS["codex"] = S.CodexBackend()
-
-
-def badge(fmt, name="work", kind="claude"):
-    S.BADGE_FORMAT = fmt
-    return S._format_badge(name, kind)
-
-
-check("the default format is unchanged", badge("{glyph} {name}") == "\N{BUST IN SILHOUETTE} work",
-      badge("{glyph} {name}"))
-check("{agent} is the agent's short name", badge("{agent} - {name}") == "Claude - work",
-      badge("{agent} - {name}"))
-check("{title} is its full name", badge("{title}: {name}") == "Claude Code: work",
-      badge("{title}: {name}"))
-check("{agent} works for codex too",
-      badge("{agent} - {name}", "spare", "codex") == "Codex - spare",
-      badge("{agent} - {name}", "spare", "codex"))
-check("a format spec is honoured", badge("{agent:>7}") == " Claude", repr(badge("{agent:>7}")))
-check("an unknown field falls back to the default",
-      badge("{nope} {name}") == "\N{BUST IN SILHOUETTE} work", badge("{nope} {name}"))
-check("an unbalanced brace falls back to the default",
-      badge("{agent {name}") == "\N{BUST IN SILHOUETTE} work", badge("{agent {name}"))
-check("a format naming the agent suppresses the prefix",
-      S._names_agent("{agent} - {name}") and S._names_agent("{title}: {name}")
-      and S._names_agent("{agent:>7}"))
-check("a format not naming the agent keeps the prefix",
-      not S._names_agent("{glyph} {name}") and not S._names_agent(""))
-
-print("\nthe top-right badge puts cached usage after the active account name")
-saved_cache = S._usage_cache()
-real_popen = S.subprocess.Popen
-launched = []
-S.subprocess.Popen = lambda *a, **kw: launched.append((a, kw))
-fake = reset()
-S.BADGE_FORMAT = "{glyph} {name}"
-S.fetch_usage = raises(AssertionError("a badge must not fetch usage"))
-S._write_json_secret(S.USAGE_CACHE, {})
-
-
-def tab_badge():
-    buffer = io.StringIO()
-    real, sys.stdout = sys.stdout, buffer
-    try:
-        S.cmd_badge(["claude"])
-    finally:
-        sys.stdout = real
-    return buffer.getvalue().strip()
-
-
-check("missing usage keeps the name", tab_badge() == "👤 Live", tab_badge())
-S._remember_usage(cache_key("Target"), [{"label": "session", "percent": 99}])
-check("another account's usage is never borrowed", tab_badge() == "👤 Live", tab_badge())
-S._remember_usage(cache_key("Live"), [
-    {"label": "session", "percent": 42, "window_seconds": 18000},
-    {"label": "weekly", "percent": 18, "window_seconds": 604800},
-])
-check("the session window follows the name", tab_badge() == "👤 Live 42%", tab_badge())
-check("pane labels keep their existing format", S.account_labels(["claude"]) == {"claude": "Live"})
-cache = S._usage_cache()
-cache[cache_key("Live")]["at"] = time.time() - S.USAGE_TTL_S - 1
-S._write_json_secret(S.USAGE_CACHE, cache)
-check("old readings carry a tilde", tab_badge() == "👤 Live ~42%", tab_badge())
-S._remember_usage(cache_key("Live"), [{"label": "weekly", "percent": 67}])
-check("missing session usage keeps only the name", tab_badge() == "👤 Live", tab_badge())
-S._remember_usage(cache_key("Live"), [{"label": "session", "percent": 0}])
-check("zero usage is shown", tab_badge() == "👤 Live 0%", tab_badge())
-S._rest_usage(cache_key("Live"), 300)
-check("a cooldown marks even a recent reading", tab_badge() == "👤 Live ~0%", tab_badge())
-S._remember_usage(cache_key("Live"), [
-    {"label": "session", "percent": 42}, {"label": "weekly", "percent": 100}])
-check("exhausted weekly usage does not replace the session", tab_badge() == "👤 Live 42%", tab_badge())
-for label in ("session", "five_hour", "5h"):
-    S._remember_usage(cache_key("Live"), [
-        {"label": "weekly_all", "percent": 67},
-        {"label": "weekly Fable", "percent": 100},
-        {"label": label, "percent": 0},
-    ])
-    check("session usage wins over exhausted Fable: " + label,
-          tab_badge() == "👤 Live 0%", tab_badge())
-S._remember_usage(cache_key("Live"), [
-    {"label": "session", "percent": 100},
-    {"label": "weekly", "percent": 67},
-])
-check("an exhausted session is shown",
-      tab_badge() == "👤 Live 100%", tab_badge())
-S._remember_usage(cache_key("Live"), [
-    {"label": "session", "percent": None},
-    {"label": "weekly Fable", "percent": 100},
-])
-check("unavailable session usage keeps only the name", tab_badge() == "👤 Live", tab_badge())
-fake.store = claude_payload("TARGET", "target-access", "target-refresh", expired=False)
-S._select_profile("claude", profile_id("Target"))
-check("an account change picks its own usage", tab_badge() == "👤 Target 99%", tab_badge())
-fake.store = claude_payload("UNSAVED", "other-access", "other-refresh", expired=False)
-check("an unsaved login gets no saved percentage", "%" not in tab_badge(), tab_badge())
-fake.store = None
-check("a logged-out badge gets no percentage", tab_badge() == "👤 logged out", tab_badge())
-check("rendering never writes credentials", fake.writes == 0)
-check("refresh workers detach from the badge's output",
-      bool(launched) and all(kw.get("start_new_session")
-                            and kw.get("stdout") == S.subprocess.DEVNULL
-                            and kw.get("stderr") == S.subprocess.DEVNULL
-                            and a[0][-2:] == ["badge-refresh", "claude"]
-                            for a, kw in launched))
-S.subprocess.Popen = real_popen
-
-print("\nbadge usage refreshes at the cache interval, only for the active login")
-fake = reset()
-S._write_json_secret(S.USAGE_CACHE, {})
-asked = []
-S.fetch_usage = lambda kind, payload: asked.append(payload["who"]) or [
-    {"label": "session", "percent": 23}]
-S.cmd_badge_refresh(["claude"])
-S.cmd_badge_refresh(["claude"])
-check("repeated ticks fetch only the live account once", asked == ["LIVE"], str(asked))
-check("the next badge reads the refreshed figure", tab_badge() == "👤 Live 23%", tab_badge())
-cache = S._usage_cache()
-for field in ("at", "badge_attempt_at"):
-    cache[cache_key("Live")][field] = time.time() - S.USAGE_TTL_S - 1
-S._write_json_secret(S.USAGE_CACHE, cache)
-S.cmd_badge_refresh(["claude"])
-check("expiry triggers another read", asked == ["LIVE", "LIVE"], str(asked))
-
-for failure in (http_error(429), urllib.error.URLError("offline"), None):
-    S._write_json_secret(S.USAGE_CACHE, {})
-    asked.clear()
-    def failed_badge_read(kind, payload):
-        asked.append(payload["who"])
-        if failure:
-            raise failure
-        return []
-    S.fetch_usage = failed_badge_read
-    S.cmd_badge_refresh(["claude"])
-    S.cmd_badge_refresh(["claude"])
-    check("failed or empty reads wait before retrying: %s" % failure,
-          asked == ["LIVE"], str(asked))
-    if getattr(failure, "code", None) == 429:
-        check("badge throttling is shared with other usage readers",
-              S._usage_cache()[cache_key("Live")]["retry_after"] > time.time())
-check("background refresh never writes credentials", fake.writes == 0)
-S._write_json_secret(S.USAGE_CACHE, saved_cache)
-S.fetch_usage = REAL_FETCH_USAGE
-
 # ---- what another plugin can read off the profile list -------------------
 #
 # autocontinue rotates to whichever account frees up soonest, so it has to see
@@ -588,13 +442,13 @@ check("an unknown kind reports nothing", usage_json("nosuchkind") == [],
 S.fetch_usage = REAL_FETCH_USAGE
 S.renew_profile = REAL_RENEW_PROFILE
 
-# ---- which codex windows reach the badge ---------------------------------
+# ---- concurrent usage readers --------------------------------------------
 
 print("\nconcurrent panes share independent provider requests")
 fake = reset()
 S.renew_profile = lambda k, p, force=False: p.get("payload")
 request_log = os.path.join(STATE, "request-count")
-for limited, badge_worker in ((False, False), (True, False), (False, True), (True, True)):
+for limited in (False, True):
     S._write_json_secret(S.USAGE_CACHE, {})
     with open(request_log, "w"):
         pass
@@ -615,10 +469,7 @@ for limited, badge_worker in ((False, False), (True, False), (False, True), (Tru
             os.close(write_fd)
             os.read(read_fd, 1)
             try:
-                if badge_worker:
-                    S.cmd_badge_refresh(["claude"])
-                else:
-                    S.usage_rows(["claude"])
+                S.usage_rows(["claude"])
             except BaseException:
                 os._exit(1)
             os._exit(0)
@@ -629,9 +480,8 @@ for limited, badge_worker in ((False, False), (True, False), (False, True), (Tru
     statuses = [os.waitpid(pid, 0)[1] for pid in children]
     with open(request_log) as handle:
         count = len(handle.readlines())
-    expected = 1 if badge_worker else 2
-    check(("two badge workers fetch the active account once" if badge_worker
-           else "two panes fetch each of two accounts once")
+    expected = 2
+    check("two panes fetch each of two accounts once"
           + (" on 429" if limited else " on success"),
           statuses == [0, 0] and count == expected, str((statuses, count)))
 S.fetch_usage = REAL_FETCH_USAGE
@@ -653,7 +503,7 @@ check("the switch check records the actual full session",
 S._remember_usage(cache_key("Live"), [{"label": "session", "percent": 25}])
 asked.clear()
 S.usage_rows(["claude"])
-check("opening the picker reuses that read instead of asking again",
+check("a non-forced usage read reuses verification instead of asking again",
       not asked, str(asked))
 
 print("\nreporting cooldowns follow the provider's Retry-After")
@@ -722,7 +572,7 @@ S.renew_profile = REAL_RENEW_PROFILE
 #
 # Codex reports two: the five-hour one that stops you hour to hour, and the
 # weekly one. Only the longest was kept, so a five-hour window sitting at 100%
-# was replaced on the badge by a roomy weekly figure — the badge said there was
+# was replaced in the picker by a roomy weekly figure — the picker said there was
 # capacity on an account that had none.
 
 
@@ -736,7 +586,7 @@ def codex_row(five_hour, weekly):
     ]}
 
 
-print("\nboth codex windows reach the badge")
+print("\nboth codex windows reach the picker")
 row = codex_row(100, 60)
 labels = [w.get("label") for w in S.shown_windows(row)]
 check("neither window is dropped", labels == ["5h", "weekly"], str(labels))
@@ -744,7 +594,7 @@ check("the five-hour window is the one shown when it is full",
       (S.summary_window(row) or {}).get("label") == "5h",
       str((S.summary_window(row) or {}).get("label")))
 summary = S.usage_summary(row)[0]
-check("the badge reports the exhausted window, not the roomy one",
+check("the picker reports the exhausted window, not the roomy one",
       "100" in summary, summary.strip())
 check("both windows are listed in the expanded view",
       len(S.usage_detail(row)) == 2, str(S.usage_detail(row)))
@@ -769,7 +619,7 @@ check("all three still show", len(S.shown_windows(claude)) == 3,
 #
 # A percentage means nothing across windows of different lengths: 42% of a week
 # is not worse than 10% of five hours. What matters is how long each window has
-# before it fills at the rate it is being spent. The badge ranked on the
+# before it fills at the rate it is being spent. The picker ranked on the
 # percentage, so a five-hour window an hour from stopping you lost to a weekly
 # window a day and a half away.
 
@@ -812,22 +662,22 @@ burst = window("5h", 0.5, 5 * 3600, 30)
 check("half a percent in thirty seconds projects nothing",
       S.time_to_limit(burst) is None, str(S.time_to_limit(burst)))
 
-print("\nthe figure shown agrees with that window's own line")
+print("\nthe detailed view retains the shown window's estimate")
 row = codex(session, weekly)
 shown = S.summary_window(row)
-check("the shown window's line names the same limit",
-      S.projection(shown).startswith("limit in"), S.projection(shown))
+check("the shown window's detailed line includes its estimated limit",
+      "limit in" in S.usage_detail(row)[0][0], str(S.usage_detail(row)))
 
-print("\nthe badge counts down to the thing that matters")
-# Choosing the right window is half the answer. The badge's own figure was the
-# window's reset, so a window two hours from stopping work still read as the
-# four and three quarter hours until it refilled.
+print("\nthe compact picker always counts down to automatic reset")
+# A filling window could exhaust before its automatic reset. The compact
+# row shows the reset only; the detailed view keeps the estimated limit.
 filling = codex(window("5h", 10, 5 * 3600, 12 * 60),
                 window("weekly", 42, 168 * 3600, 1601 * 60))
 text = S.usage_summary(filling)[0]
-# 90% still to spend at 10% per twelve minutes is an hour and three quarters.
-check("a filling window counts down to when it fills", "1h48" in text, text.strip())
-check("and not to when it resets", "4h4" not in text, text.strip())
+check("a filling window counts down to its automatic reset",
+      "4h47" in text or "4h48" in text, text.strip())
+check("the compact row omits the earlier estimated limit",
+      "1h47" not in text and "1h48" not in text, text.strip())
 
 emptied = codex(window("5h", 100, 5 * 3600, 4 * 3600),
                 window("weekly", 42, 168 * 3600, 1601 * 60))
@@ -933,29 +783,15 @@ check("the session is shown",
       (S.summary_window(claude) or {}).get("label") == "session",
       str((S.summary_window(claude) or {}).get("label")))
 
-# ---- the column title, and the rows that are not a limit -----------------
-#
-# The figure counts down to when the window fills, but the column was still
-# titled "resets in" from before it did. A session at 10% twelve minutes in read
-# about an hour and three quarters under that title, while its reset was 4h48
-# away.
-#
-# The title names the limit. A row with no limit still ahead of it shows its
-# reset instead, and carries a mark so it does not read as a limit that is not
-# coming. That is the rule, rather than a list of cases: the code asks whether
-# there is a limit to count down to, and four windows answer no.
-
-print("\nthe column title names what the figure counts down to")
-check("it says limit in", S.SUMMARY_HEAD.endswith("limit in"),
-      repr(S.SUMMARY_HEAD))
-check("and sits over the figure it titles",
-      S.SUMMARY_HEAD.index("limit in") == 14, repr(S.SUMMARY_HEAD))
+# ---- automatic reset countdowns in the compact view ----------------------
+# Every known automatic reset carries a mark, including when a window has
+# an estimated exhaustion time before that reset.
 
 # `filling` and `emptied` are the two rows the section above already checked the
 # figure of. What is checked here is which of them is marked.
-print("\na figure that is a limit carries no mark")
-check("the filling window is unmarked",
-      S.RESET_MARK not in S.usage_summary(filling)[0],
+print("\na filling window also marks its automatic reset")
+check("the filling window's reset is marked",
+      S.usage_summary(filling)[0].rstrip().endswith(S.RESET_MARK),
       S.usage_summary(filling)[0].strip())
 
 print("\na spent window's figure is a reset, and says so")
@@ -1090,9 +926,9 @@ check("and saved_at moved with it", saved["saved_at"] > 1, str(saved["saved_at"]
 #
 # The picker prints a refusal on its own status line. Every other path — the
 # `next` keybinding above all — wrote it to stderr, which herdr drops. The
-# failure then read as "the badge did not change", with nothing saying why.
-# A polled command must stay silent: `badge` runs once a second from the tab
-# bar, and a toast per tick would be worse than the silence it replaces.
+# failure gave no visible explanation to the user.
+# Polled commands such as `list` must stay silent instead of sending a toast
+# on every tick.
 
 
 def run_main(*argv):
@@ -1113,10 +949,8 @@ def refuse(_argv):
 print("\na refused switch says so on screen, not only on stderr")
 told = []
 S.notify = lambda title, body="": told.append((title, body))
-S.refresh_stable_link = lambda: None
 real_dispatch = dict(S.DISPATCH)
 S.DISPATCH["next"] = refuse
-S.DISPATCH["badge"] = refuse
 code = run_main("next")
 check("it still reports failure", code == 1, str(code))
 check("it sends one notification", len(told) == 1, str(told))
@@ -1127,7 +961,8 @@ check("the title says what failed",
 
 print("\nbut a polled command never raises a toast")
 told.clear()
-code = run_main("badge")
+S.DISPATCH["list"] = refuse
+code = run_main("list")
 check("nothing was sent", told == [], str(told))
 check("it still reports failure", code == 1, str(code))
 print("\nand a missing herdr never turns a refusal into a traceback")
@@ -1142,6 +977,23 @@ S.DISPATCH.update(real_dispatch)
 
 records = subprocess.run([sys.executable, "-B", str(Path(__file__).with_name("test_account_records.py"))])
 check("UUID account record regressions", records.returncode == 0)
+runtime = subprocess.run([sys.executable, "-B", str(Path(__file__).with_name("test_codex_runtime.py"))])
+check("Codex transport regressions", runtime.returncode == 0)
+
+machine = subprocess.run([sys.executable, "-B", str(Path(__file__).with_name("test_codex_machine.py"))])
+check("machine-wide Codex account regressions", machine.returncode == 0)
+
+logins = subprocess.run([sys.executable, "-B", str(Path(__file__).with_name("test_codex_login.py"))])
+check("isolated Codex registration and renewal regressions", logins.returncode == 0)
+
+claude_logins = subprocess.run([sys.executable, "-B", str(Path(__file__).with_name("test_claude_login.py"))])
+check("isolated Claude beta registration regressions", claude_logins.returncode == 0)
+
+picker = subprocess.run([sys.executable, "-B", str(Path(__file__).with_name("test_usage_picker.py"))])
+check("account picker navigation and usage cache regressions", picker.returncode == 0)
+
+resets = subprocess.run([sys.executable, "-B", str(Path(__file__).with_name("test_codex_resets.py"))])
+check("earned Codex reset selection, confirmation and idempotency regressions", resets.returncode == 0)
 
 shutil.rmtree(STATE, ignore_errors=True)
 print("\n%s — %d of the checks failed"

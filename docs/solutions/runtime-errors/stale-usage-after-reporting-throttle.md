@@ -66,3 +66,52 @@ exactly one request per account, both for successful reads and HTTP 429s.
 This proves request deduplication within the switcher, not why Anthropic
 throttled an individual account. Other clients can still query that endpoint,
 and provider throttling remains possible.
+
+# Picker visibility and account association (2026-10-09)
+
+Read-only inspection found five Codex registrations on disk, while the user
+sometimes saw three in the picker. A small fake curses screen reproduced the
+cause: rendering stopped at the pane bottom without scrolling. Expanded usage
+made the problem worse. The picker now counts registrations and scrolls to keep
+the selected account visible. Selection follows `(kind, UUID)`, rather than its
+position in a changing list. Legacy records no longer move when renewal updates
+`saved_at`.
+
+A fake endpoint reproduced stale reads after pressing `u`: recent cache entries
+prevented any request. Explicit picker/panel refresh now bypasses the normal
+TTL, preserving provider cooldowns. New registrations are detected on UI ticks
+and their readings are collected without waiting for the old list's timer.
+Errors persist in each UUID's cache entry until successful collection, so a
+later cache-only tick does not remove a failed-read warning.
+
+The saved-registration identity and the selected authentication grant serve
+different purposes. A fresh login for a person/workspace already registered
+was incorrectly labeled unsaved and usage was read with the older saved token.
+The picker now tests registration presence independently. Usage may read the
+matching live person/workspace's token without selecting or overwriting any
+UUID. Another person in the same workspace cannot supply that account's usage.
+The save prompt appears only for an absent identity and reads
+`(press 's' to save this account)`.
+
+`test_usage_picker.py`, included by `python3 -B test_switcher.py`, reproduces
+clipped accounts, expanded-row scrolling, selection drift, stale explicit
+refresh, new registrations, fresh live authentication, and persistent errors.
+It also checks five distinct users with identical labels in one workspace,
+duplicate registrations, and cooldown preservation. All data, credentials,
+and HTTP responses are fictitious. No real authentication, token renewal,
+provider usage request, or daemon restart was performed in this investigation.
+
+# Fresh readings on picker entry (2026-10-10)
+
+A fake-curses regression reproduced opening the picker with a recent usage
+cache written before reset counts existed: it showed the old percentage and
+`-` for resets without querying the provider. Reopening with a recent complete
+cache also kept the old usage and reset count. Both cases were caused by the
+initial `usage_rows()` honoring the normal TTL.
+
+The initial read now bypasses the TTL, like `r`, while preserving each UUID's
+provider cooldown. Subsequent idle ticks still reuse cached readings until
+the normal interval or a scheduled post-reset check. Fake HTTP regressions in
+`test_usage_picker.py` verify fresh percentages/counts on the first frame,
+reopening, no repeated request on the next idle tick, and refreshing the other
+four accounts while one is in cooldown. No real credentials or resets were used.

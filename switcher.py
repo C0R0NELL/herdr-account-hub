@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Hot-swap Claude Code / Codex accounts from inside herdr.
+"""Manage Claude Code / Codex accounts from inside Herdr.
 
-Both CLIs re-read their credential store on every request, so swapping the
-stored login switches which account your *already running* agents bill to —
-no logout, no browser round-trip, no restarting panes. This plugin keeps named
-snapshots of those credential stores and swaps them atomically.
+Credential selection on disk does not prove a running Codex adopted it.
+Codex account changes apply to its shared local daemon. Native terminal clients
+reconnect to their existing chats after the official daemon restart.
 
 What a profile holds (per agent kind):
   claude  the OAuth credential blob (macOS Keychain item "Claude Code-credentials",
@@ -20,9 +19,8 @@ Subcommands:
   ui       the overlay picker (plugin pane entrypoint)
   open     open that pane (action)
   next     switch to the next profile of the focused agent's kind (action)
-  save     snapshot the current login into a new profile (action)
-  status   print what is logged in and what is saved (action)
-  stamp    refresh the $acct pane badges (startup hook)
+  save     save the current account if it is not already registered (action)
+  status   print what is logged in and what is saved (terminal diagnostic)
   switch   switch <kind> <uuid|unique-label> — the scriptable form
   reauth   reauth <kind> <uuid> — replace only this record from the live login
 """
@@ -33,14 +31,19 @@ import hashlib
 import json
 import os
 import platform
+import queue
+import random
 import re
 import signal
+import socket
+import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import urllib.error
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 import time
 import uuid
@@ -48,7 +51,6 @@ import uuid
 PLUGIN_ID = os.environ.get("HERDR_PLUGIN_ID", "c0r0nell.account-hub")
 HERDR = os.environ.get("HERDR_BIN_PATH", "herdr")
 # Resolve the script rather than the caller's cwd or an inherited plugin path.
-# This also works when the script is reached through STATE_DIR/current.
 ROOT = os.path.dirname(os.path.realpath(__file__))
 # Each checkout owns its private data. Herdr's injected state/config directories
 # and Account Switch's environment settings must not redirect Account Hub.
@@ -58,12 +60,6 @@ PROFILES_DIR = os.path.join(STATE_DIR, "profiles")
 BACKUP_DIR = os.path.join(STATE_DIR, "backups")
 LOCK = os.path.join(STATE_DIR, "switch.lock")
 SELECTION = os.path.join(STATE_DIR, "selection.json")
-# The checkout-local state directory has a stable link for status commands.
-# ROOT uses realpath so following this link cannot repoint it at itself.
-STABLE_LINK = os.path.join(STATE_DIR, "current")
-
-TOKEN = "acct"
-UNSAVED_MARK = "*"  # live login that no profile has a copy of
 KEEP_BACKUPS = 10
 IS_MAC = platform.system() == "Darwin"
 
@@ -128,24 +124,16 @@ def _num_env(name, default):
 
 
 NOTIFY = _flag("ACCOUNT_HUB_NOTIFY")
-BADGE = _flag("ACCOUNT_HUB_BADGE")
-# Badge a kind with no saved profile too.
-BADGE_ALWAYS = _flag("ACCOUNT_HUB_BADGE_ALWAYS", default=False)
-GLYPH = _setting("ACCOUNT_HUB_GLYPH") or "\N{BUST IN SILHOUETTE}"  # 👤
-# Both fields are optional: "{glyph}" is a badge with no text, "{name}" is text
-# with no glyph.
-BADGE_FORMAT = _setting("ACCOUNT_HUB_BADGE_FORMAT") or "{glyph} {name}"
-SEPARATOR = _setting("ACCOUNT_HUB_SEPARATOR") or " · "
 # How long any one command we shell out to may take before it is abandoned.
 # Generous: it is a backstop against never finishing, not a performance budget.
 COMMAND_TIMEOUT_S = _num_env("ACCOUNT_HUB_COMMAND_TIMEOUT_S", 30.0)
-# How long to wait for another switch's lock before refusing. A real switch
-# holds it for well under a second, so this never trips in normal use.
+# How long another reader/switch waits for the shared lock. A Codex restart can
+# hold it during graceful shutdown; competing actions report that wait.
 LOCK_TIMEOUT_S = _num_env("ACCOUNT_HUB_LOCK_TIMEOUT_S", 5.0)
 
 
 class SwitchError(Exception):
-    """A switch that could not be completed (live store left untouched)."""
+    """An operation that could not be confirmed; message describes recovery."""
 
 
 # ---- running a command ----------------------------------------------------
@@ -167,7 +155,7 @@ def _abandon(proc):
         pass
 
 
-def _run(argv, stdin_text=None, timeout=None):
+def _run(argv, stdin_text=None, timeout=None, env=None):
     """Run one command, and wait only on the command itself.
 
     Output goes to temporary files rather than pipes, because a pipe is read
@@ -202,7 +190,7 @@ def _run(argv, stdin_text=None, timeout=None):
             proc = subprocess.Popen(
                 argv, stdout=out, stderr=err,
                 stdin=stdin if stdin is not None else subprocess.DEVNULL,
-                text=True, start_new_session=True,
+                text=True, start_new_session=True, env=env,
             )
         finally:
             if stdin is not None:
@@ -343,7 +331,7 @@ def _write_json_secret(path, data, mode=0o600):
 
 
 def _fingerprint(identity):
-    """Provider identity guard, never a registration key or deduplication key.
+    """Provider identity guard, never a registration key.
 
     Codex's account_id can name a shared workspace; include the person too.
     """
@@ -369,8 +357,7 @@ def _jwt_claims(token):
 class Backend:
     kind = ""
     title = ""
-    # What to call this agent in a badge. Shorter than `title`, because a tab
-    # bar showing two accounts has no room for "Claude Code".
+    # Short provider name used in sign-in dialogs and terminal instructions.
     short = ""
 
     def present(self):
@@ -395,7 +382,7 @@ class Backend:
             bits.append(identity["plan"])
         if identity.get("org"):
             bits.append(identity["org"])
-        return " · ".join(str(b) for b in bits if b)
+        return " | ".join(str(b) for b in bits if b)
 
 
 class ClaudeBackend(Backend):
@@ -545,6 +532,9 @@ class CodexBackend(Backend):
             raise SwitchError("profile holds no codex credentials")
         _write_json_secret(self.auth, auth)
 
+    def prepare_switch(self):
+        return CodexMachine(self)
+
     def identity(self, payload):
         auth = payload.get("auth") or {}
         tokens = auth.get("tokens") or {}
@@ -633,7 +623,9 @@ def list_profiles(kind):
             data["identity"] = BACKENDS[kind].identity(data["payload"])
             data["fingerprint"] = _fingerprint(data["identity"])
             out.append(data)
-    out.sort(key=lambda p: (p.get("created_at") or p.get("saved_at") or 0, p["id"]))
+    # Renewal changes saved_at, not registration order. Legacy records have
+    # no creation date; keep their ordering stable by UUID instead.
+    out.sort(key=lambda p: (p.get("created_at") or 0, p["id"]))
     return out
 
 
@@ -788,6 +780,22 @@ def active_profile(kind, live=None):
     return None
 
 
+def _live_account_saved(kind, live, profiles=None):
+    """Detect an existing account without selecting or changing any UUID.
+
+    A shared Codex workspace alone cannot identify a person. When person
+    metadata is absent, only an identical credential snapshot proves a match.
+    """
+    if live is None:
+        return False
+    identity = BACKENDS[kind].identity(live)
+    fingerprint = _fingerprint(identity)
+    known_person = kind != "codex" or identity.get("user_id") or identity.get("email")
+    records = list_profiles(kind) if profiles is None else profiles
+    return any(p["payload"] == live or (fingerprint and known_person
+               and p["fingerprint"] == fingerprint) for p in records)
+
+
 def _backup(kind, payload):
     _secure_dir(BACKUP_DIR)
     path = os.path.join(BACKUP_DIR, f"{kind}-{int(time.time())}.json")
@@ -806,69 +814,82 @@ def _backup(kind, payload):
 # ---- the switch itself ----------------------------------------------------
 
 def switch(kind, key):
-    """Install a saved profile as the live login. Returns a status string."""
+    """Apply a saved account; Codex uses one account for this machine's home."""
     backend = BACKENDS[kind]
     with _Lock():
         target = get_profile(kind, key)
         if target is None:
             raise SwitchError(f"no {kind} profile named {key!r}")
-
         live = backend.read_live()
         outgoing = active_profile(kind, live) if live is not None else None
-        if outgoing is not None and outgoing["id"] == target["id"]:
+        runtime = backend.prepare_switch() if kind == "codex" else None
+        if outgoing is not None and outgoing["id"] == target["id"] and runtime is None:
             sync_live_profile(kind, live)
             return f"{kind}: already on {target['label']}"
-
-        # Prove the saved login still works before overwriting a working one.
-        # This can rotate the target's tokens, so keep what it hands back: the
-        # write below installs it, and the profile is rewritten from it at the
-        # end of the switch.
+        if kind == "codex" and outgoing and outgoing["id"] == target["id"]:
+            # Codex may already have rotated the selected login. Verify its
+            # current credentials, never spend the older saved refresh token.
+            sync_live_profile(kind, live)
+            target = _profile_by_id(kind, target["id"])
         target["payload"] = proven_payload(kind, target)
 
         if live is not None:
-            # Never overwrite a login we don't have a copy of.
             if outgoing is None:
                 ident = backend.identity(live)
-                rescued = make_profile(kind, "autosaved-" + default_label(kind, ident), live)
-                write_profile(rescued)
-            else:
-                # Refresh the snapshot before parking it. The CLI keeps renewing
-                # the live tokens, so a profile saved hours ago holds older ones.
-                # Restoring a stale copy can leave that account unable to renew,
-                # which costs a browser login — and rotating makes that routine.
+                write_profile(make_profile(kind, "autosaved-" + default_label(kind, ident), live))
+            elif outgoing["id"] != target["id"]:
                 outgoing["payload"] = live
                 outgoing["identity"] = backend.identity(live)
                 outgoing["saved_at"] = int(time.time())
                 write_profile(outgoing)
             _backup(kind, live)
 
+        # Renewing the account already on disk can spend its old refresh token.
+        # Recovery for that same registration must retain the renewed grant.
+        previous = (target["payload"] if outgoing and outgoing["id"] == target["id"]
+                    else live)
+
         try:
             backend.write_live(target["payload"])
-
-            # Compare credentials too: equal provider identities do not prove
-            # that the requested record's authentication was installed.
             check = backend.read_live()
             wanted = target["payload"]
             credential_key = "auth" if kind == "codex" else "credentials"
             got = _fingerprint(backend.identity(check)) if check else None
             if (not check or got != _fingerprint(backend.identity(wanted))
                     or check.get(credential_key) != wanted.get(credential_key)):
-                raise SwitchError(f"{kind}: write did not take; previous login restored")
-            target["identity"] = backend.identity(wanted)
+                raise SwitchError(f"{kind}: credential write did not take")
+            result = runtime.apply(wanted) if runtime else ""
+            # Adopt a rotation performed naturally by the restarted Codex.
+            applied = backend.read_live()
+            if not applied or (kind == "codex" and not _same_login(kind, target, applied)):
+                raise SwitchError("Credentials changed during reload; account not confirmed")
+            target["payload"] = applied
+            target["identity"] = backend.identity(target["payload"])
             target["fingerprint"] = _fingerprint(target["identity"])
             target["last_used"] = int(time.time())
             write_profile(target)
+            if runtime:
+                runtime.record(target)
             _select_profile(kind, target["id"])
-        except (SwitchError, OSError):
-            if live is not None:
-                try:
-                    backend.write_live(live)
-                except (SwitchError, OSError):
-                    pass
-            raise
+        except (SwitchError, OSError) as exc:
+            try:
+                if previous is not None:
+                    backend.write_live(previous)
+                elif kind == "codex":
+                    os.unlink(backend.auth)
+                if runtime and runtime.restarted:
+                    if previous is None:
+                        raise SwitchError("previous account was signed out")
+                    runtime.apply(previous)
+            except (SwitchError, OSError):
+                raise SwitchError("Account change failed; previous login reload could not be confirmed. Check Codex before retrying.") from exc
+            raise SwitchError(str(exc) + "; previous login restored") from exc
 
-    stamp_badges()
     ident = backend.describe(target.get("identity") or {})
+    if kind == "codex":
+        message = f"Codex: switched to {target['label']} for this machine; {result}"
+        notify("Codex account switched", target["label"])
+        return message
     notify(f"{backend.title}: {target['label']}", ident)
     return f"{kind}: switched to {target['label']} ({ident})"
 
@@ -885,6 +906,411 @@ def next_profile(kind):
         ids = [p["id"] for p in profiles]
         idx = (ids.index(current["id"]) + 1) % len(profiles)
     return switch(kind, profiles[idx]["id"])
+
+
+# ---- Codex machine-wide authentication reload -----------------------------
+
+CODEX = os.environ.get("ACCOUNT_HUB_CODEX_BIN", "codex")
+CODEX_APPLICATION = os.path.join(STATE_DIR, "codex-application.json")
+CODEX_RECONNECT_TIMEOUT_S = _num_env("ACCOUNT_HUB_CODEX_RECONNECT_TIMEOUT_S", 120.0)
+
+
+def _codex_environment():
+    environment = os.environ.copy()
+    environment["CODEX_HOME"] = BACKENDS["codex"].home
+    # Keep CODEX_SQLITE_HOME and the user's config (including sqlite_home).
+    return environment
+
+
+def _codex_shutdown_grace_seconds(home):
+    """Match the official daemon's stop-settings defaults and 0..300s range."""
+    settings = _read_json(os.path.join(home, "app-server-daemon", "settings.json"))
+    grace = settings.get("shutdownGraceSeconds", 60) if isinstance(settings, dict) else 60
+    return grace if type(grace) is int and 0 <= grace <= 300 else 60
+
+
+def _check_codex_compatibility():
+    try:
+        result = _run([CODEX, "--version"], env=_codex_environment())
+    except OSError as exc:
+        raise SwitchError("Codex CLI is not available; account unchanged") from exc
+    version = re.search(r"(\d+)\.(\d+)\.(\d+)", result.stdout)
+    if (result.returncode or not version
+            or tuple(map(int, version.groups())) < (0, 162, 0)):
+        raise SwitchError("Automatic chat reload requires Codex CLI 0.162.0 or newer")
+
+
+class CodexMachine:
+    """Reload the existing shared daemon; native clients reconnect themselves.
+
+    The credential store remains the source of truth. This object is a short
+    lived switch transaction, not another Codex launcher or authentication host.
+    """
+
+    def __init__(self, backend):
+        self.backend = backend
+        self.environment = _codex_environment()
+        self.info = None
+        self.threads = {}
+        self.restarted = False
+        _check_codex_compatibility()
+        result = _run([CODEX, "app-server", "daemon", "version"], env=self.environment)
+        if result.returncode:
+            # The official passive probe reports these OS errors for an absent
+            # socket. A timeout, permission failure or malformed reply is not
+            # evidence that no daemon is running.
+            if ("failed to connect to" in result.stderr and any(
+                    reason in result.stderr for reason in (
+                        "No such file or directory", "Connection refused"))):
+                self._check_file_store()
+                return
+            raise SwitchError("Cannot inspect the Codex daemon; account unchanged")
+        self.info = self._parse_info(result)
+        if self.info.get("status") == "notRunning":
+            self.info = None
+            self._check_file_store()
+            return
+        if self.info.get("status") != "running" or self.info.get("backend") != "pid":
+            raise SwitchError("Codex is not using its managed local daemon; account unchanged")
+        version = re.search(r"(\d+)\.(\d+)\.(\d+)", self.info.get("appServerVersion") or "")
+        if not version or tuple(map(int, version.groups())) < (0, 162, 0):
+            raise SwitchError("Automatic chat reload requires Codex daemon 0.162.0 or newer")
+        rpc = self._connect(self.info)
+        try:
+            config = rpc.call("config/read", {"includeLayers": False}).get("config") or {}
+            self._check_config(config)
+            for thread_id in self._loaded(rpc):
+                thread = self._thread(rpc, thread_id)
+                if thread.get("ephemeral"):
+                    raise SwitchError("An open chat is temporary and cannot be safely reloaded")
+                self.threads[thread_id] = thread
+        finally:
+            rpc.close()
+
+    def _check_config(self, config):
+        if (config.get("cli_auth_credentials_store") or "file") != "file":
+            raise SwitchError('Codex must use cli_auth_credentials_store = "file" to switch auth.json')
+        if (config.get("model_provider") or "openai") != "openai":
+            raise SwitchError("This Codex server uses a different model provider; account unchanged")
+
+    def _check_file_store(self):
+        path = os.path.join(self.backend.home, "config.toml")
+        if not os.path.exists(path):
+            return
+        try:
+            import tomllib
+            with open(path, "rb") as handle:
+                self._check_config(tomllib.load(handle))
+        except (ImportError, ValueError, OSError) as exc:
+            raise SwitchError("Cannot inspect Codex configuration; account unchanged") from exc
+
+    @staticmethod
+    def _parse_info(result):
+        try:
+            info = json.loads(result.stdout)
+            if not isinstance(info, dict):
+                raise ValueError()
+            return info
+        except (ValueError, TypeError) as exc:
+            raise SwitchError("Codex returned an invalid daemon response") from exc
+
+    def _connect(self, info):
+        path = info.get("socketPath")
+        try:
+            metadata = os.stat(path)
+            if not os.path.isabs(path) or metadata.st_uid != os.getuid() or metadata.st_mode & 0o077:
+                raise OSError("unsafe socket")
+            return CodexRPC(path, self.environment)
+        except (OSError, TypeError, ValueError) as exc:
+            raise SwitchError("Cannot connect to the private Codex control socket") from exc
+
+    @staticmethod
+    def _loaded(rpc):
+        ids, seen, cursor = set(), set(), None
+        for _ in range(1000):
+            result = rpc.call("thread/loaded/list", {"cursor": cursor, "limit": 100})
+            page = result.get("data")
+            if not isinstance(page, list) or any(not _valid_uuid(value) for value in page):
+                raise SwitchError("Cannot identify the open Codex chats")
+            ids.update(page)
+            cursor = result.get("nextCursor")
+            if not cursor:
+                return ids
+            if cursor in seen:
+                break
+            seen.add(cursor)
+        raise SwitchError("Codex returned an incomplete chat list")
+
+    @staticmethod
+    def _thread(rpc, thread_id):
+        thread = rpc.call("thread/read", {"threadId": thread_id, "includeTurns": False}).get("thread") or {}
+        if thread.get("id") != thread_id or not thread.get("cwd"):
+            raise SwitchError("Cannot confirm the existing chat and directory")
+        return thread
+
+    def apply(self, payload):
+        if self.info is None:
+            return "new chats will use this account"
+        self.restarted = True
+        grace = _codex_shutdown_grace_seconds(self.backend.home)
+        result = _run([CODEX, "app-server", "daemon", "restart"],
+                      env=self.environment, timeout=grace + 90)
+        if result.returncode:
+            raise SwitchError("Codex could not restart; account change not confirmed")
+        info = self._parse_info(result)
+        if info.get("status") != "restarted" or info.get("backend") != "pid":
+            raise SwitchError("Codex did not confirm its restart")
+        rpc = self._connect(info)
+        try:
+            self._check_config(rpc.call("config/read", {"includeLayers": False}).get("config") or {})
+            account = rpc.call("account/read", {"refreshToken": False}).get("account") or {}
+            auth = payload.get("auth") or {}
+            if auth.get("OPENAI_API_KEY"):
+                confirmed = account.get("type") == "apiKey"
+            else:
+                expected = self.backend.identity(payload).get("email")
+                confirmed = bool(expected and account.get("type") == "chatgpt"
+                                 and account.get("email") == expected)
+            if not confirmed:
+                raise SwitchError("The restarted Codex did not adopt the selected account")
+            deadline = time.monotonic() + CODEX_RECONNECT_TIMEOUT_S
+            while True:
+                if set(self.threads).issubset(self._loaded(rpc)):
+                    break
+                if time.monotonic() >= deadline:
+                    raise SwitchError("Some chats have not reconnected; account change not confirmed")
+                time.sleep(.2)
+            for thread_id, before in self.threads.items():
+                after = self._thread(rpc, thread_id)
+                if any(before.get(key) != after.get(key) for key in ("id", "name", "cwd")):
+                    raise SwitchError("Codex did not preserve a chat's ID, title or directory")
+            live = self.backend.read_live()
+            if not _same_login("codex", {"payload": payload}, live):
+                raise SwitchError("Codex credentials changed during reload; account not confirmed")
+            self.info = info
+        finally:
+            rpc.close()
+        return "%d chats reloaded" % len(self.threads)
+
+    def record(self, profile):
+        info = self.info
+        metadata = os.stat(info["socketPath"]) if info else None
+        _write_json_secret(CODEX_APPLICATION, {
+            "profile_id": profile["id"], "home": os.path.realpath(self.backend.home),
+            "status": "applied" if info else "ready_for_new_chats",
+            "socket": info.get("socketPath") if info else None,
+            "socket_generation": [metadata.st_dev, metadata.st_ino] if metadata else None,
+            "auth_hash": _codex_auth_hash(self.backend.read_live()),
+            "chat_count": len(self.threads), "at": int(time.time()),
+        })
+
+
+def _codex_auth_hash(payload):
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+
+def codex_application_status():
+    """A stale file/socket generation never claims that a switch is applied."""
+    state = _read_json(CODEX_APPLICATION) or {}
+    backend = BACKENDS["codex"]
+    if (state.get("profile_id") != _selection().get("codex")
+            or state.get("home") != os.path.realpath(getattr(backend, "home", ""))
+            or state.get("auth_hash") != _codex_auth_hash(backend.read_live())):
+        return "reload unverified"
+    if state.get("status") == "ready_for_new_chats":
+        return "ready for new chats"
+    try:
+        metadata = os.stat(state["socket"])
+        if [metadata.st_dev, metadata.st_ino] == state.get("socket_generation"):
+            return "applied"
+    except (KeyError, OSError, TypeError):
+        pass
+    return "reload unverified"
+
+
+class _UnixWebSocket:
+    """The local Codex control socket uses WebSocket frames, not raw JSONL."""
+
+    MAX_MESSAGE = 8 * 1024 * 1024
+
+    def __init__(self, path):
+        self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.socket.settimeout(20)
+        self.buffer = bytearray()
+        self.send_lock = threading.Lock()
+        try:
+            self.socket.connect(path)
+            key = base64.b64encode(os.urandom(16)).decode()
+            self.socket.sendall(("GET / HTTP/1.1\r\nHost: localhost\r\n"
+                "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n").encode())
+            while b"\r\n\r\n" not in self.buffer:
+                chunk = self.socket.recv(4096)
+                if not chunk or len(self.buffer) > 16384:
+                    raise SwitchError("Codex WebSocket handshake failed")
+                self.buffer.extend(chunk)
+            headers, remainder = bytes(self.buffer).split(b"\r\n\r\n", 1)
+            self.buffer = bytearray(remainder)
+            lines = headers.decode("ascii").split("\r\n")
+            fields = {name.lower(): value.strip() for name, value in
+                      (line.split(":", 1) for line in lines[1:] if ":" in line)}
+            expected = base64.b64encode(hashlib.sha1(
+                (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
+            if (lines[0].split()[1] != "101"
+                    or fields.get("sec-websocket-accept", "") != expected):
+                raise SwitchError("Codex WebSocket handshake was not accepted")
+            self.socket.settimeout(None)
+        except Exception:
+            self.socket.close()
+            raise
+
+    def _read(self, size):
+        while len(self.buffer) < size:
+            chunk = self.socket.recv(min(65536, size - len(self.buffer)))
+            if not chunk:
+                raise OSError("Codex socket closed")
+            self.buffer.extend(chunk)
+        result = bytes(self.buffer[:size])
+        del self.buffer[:size]
+        return result
+
+    def _send_frame(self, opcode, payload):
+        if len(payload) > self.MAX_MESSAGE:
+            raise SwitchError("Codex control message is too large")
+        mask = os.urandom(4)
+        size = len(payload)
+        header = bytes([0x80 | opcode])
+        if size < 126:
+            header += bytes([0x80 | size])
+        elif size < 65536:
+            header += bytes([0x80 | 126]) + struct.pack("!H", size)
+        else:
+            header += bytes([0x80 | 127]) + struct.pack("!Q", size)
+        masked = bytes(value ^ mask[index % 4] for index, value in enumerate(payload))
+        with self.send_lock:
+            self.socket.sendall(header + mask + masked)
+
+    def send(self, message):
+        self._send_frame(1, json.dumps(message).encode())
+
+    def receive(self):
+        fragments = bytearray()
+        started = False
+        while True:
+            first, second = self._read(2)
+            opcode, final = first & 15, bool(first & 128)
+            if first & 0x70 or second & 128:
+                raise OSError("unsupported Codex WebSocket frame")
+            size = second & 127
+            if size == 126:
+                size = struct.unpack("!H", self._read(2))[0]
+            elif size == 127:
+                size = struct.unpack("!Q", self._read(8))[0]
+            if size > self.MAX_MESSAGE or len(fragments) + size > self.MAX_MESSAGE:
+                raise OSError("Codex message exceeds the control limit")
+            payload = self._read(size)
+            if opcode in (8, 9, 10):
+                if not final or size > 125:
+                    raise OSError("invalid Codex WebSocket control frame")
+                if opcode == 8:
+                    raise OSError("Codex connection closed")
+                if opcode == 9:
+                    self._send_frame(10, payload)
+                continue
+            if (opcode == 1 and not started) or (opcode == 0 and started):
+                started = True
+                fragments.extend(payload)
+            else:
+                raise OSError("unsupported Codex control message")
+            if final:
+                return json.loads(fragments.decode())
+
+    def close(self):
+        try:
+            self.socket.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        self.socket.close()
+
+
+class CodexRPC:
+    """JSON-RPC over a private Unix WebSocket, with bounded request waits."""
+
+    def __init__(self, path, environment, on_request=None):
+        self.transport = _UnixWebSocket(path)
+        self.messages = queue.Queue(maxsize=4096)
+        self.counter = 0
+        self.on_request = on_request
+        threading.Thread(target=self._reader, daemon=True).start()
+        try:
+            self.call("initialize", {"clientInfo": {
+                "name": "account_hub", "title": "Account Hub", "version": "0.2.0"},
+                "capabilities": {"experimentalApi": False}})
+            self.send({"method": "initialized"})
+        except Exception:
+            self.close()
+            raise
+
+    def _reader(self):
+        try:
+            while True:
+                self.messages.put(self.transport.receive(), timeout=1)
+        except (ValueError, OSError, queue.Full):
+            pass
+        finally:
+            try:
+                self.messages.put(None, timeout=1)
+            except queue.Full:
+                pass
+
+    def send(self, message):
+        try:
+            self.transport.send(message)
+        except (OSError, ValueError) as exc:
+            raise SwitchError("Codex control connection closed") from exc
+
+    def _handle(self, message):
+        if message is None:
+            raise SwitchError("Codex control connection closed")
+        if not isinstance(message, dict):
+            raise SwitchError("Codex sent an invalid control message")
+        if message.get("method") and "id" in message:
+            if self.on_request:
+                self.on_request(message)
+            else:
+                self.send({"id": message["id"], "error": {
+                    "code": -32601, "message": "Account Hub cannot serve this request"}})
+
+    def call(self, method, params=None, timeout=20):
+        self.counter += 1
+        request_id = self.counter
+        self.send({"id": request_id, "method": method, "params": params or {}})
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                message = self.messages.get(timeout=max(.001, deadline - time.monotonic()))
+            except queue.Empty:
+                break
+            self._handle(message)
+            if message.get("id") == request_id and not message.get("method"):
+                if "error" in message:
+                    # Do not echo a server error containing credential values.
+                    error = message["error"] or {}
+                    code = error.get("code", "unknown")
+                    raise SwitchError(f"Codex rejected {method} (RPC {code}); no confirmation")
+                return message.get("result") or {}
+        raise SwitchError(f"Codex did not confirm {method} before the timeout")
+
+    def poll(self):
+        while True:
+            try:
+                message = self.messages.get_nowait()
+            except queue.Empty:
+                return
+            self._handle(message)
+
+    def close(self):
+        self.transport.close()
 
 
 # ---- usage ----------------------------------------------------------------
@@ -961,8 +1387,13 @@ def bar_for(percent, width=None):
     return BAR_FULL * filled + BAR_EMPTY * (width - filled)
 
 
-def _http_json(url, headers):
-    request = urllib.request.Request(url, headers=headers)
+def _http_json(url, headers, body=None):
+    headers = dict(headers)
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode()
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(url, headers=headers, data=data)
     with urllib.request.urlopen(request, timeout=USAGE_TIMEOUT_S) as response:
         return json.load(response)
 
@@ -1269,7 +1700,7 @@ def renew_profile(kind, profile, force=False):
             if not renewed:
                 return None
             auth["tokens"] = renewed
-            auth["last_refresh"] = datetime.now().isoformat()
+            auth["last_refresh"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
             payload = dict(payload)
             payload["auth"] = auth
         else:
@@ -1287,6 +1718,29 @@ def renew_profile(kind, profile, force=False):
     return payload
 
 
+class UsageWindows(list):
+    """Usage windows plus optional earned-reset metadata from the same read.
+
+    Remains a list for the existing usage consumers; cache writers retain the
+    summary without a second request or a separate polling engine.
+    """
+    def __init__(self, windows, reset_credits):
+        super().__init__(windows)
+        self.reset_credits = reset_credits
+
+
+def _reset_summary(body):
+    count = body.get("available_count") if isinstance(body, dict) else None
+    if type(count) is not int or count < 0:
+        return None
+    return {"available_count": count}
+
+
+def _codex_usage_reading(body):
+    return UsageWindows(_codex_windows(body),
+                        _reset_summary((body or {}).get("rate_limit_reset_credits")))
+
+
 def fetch_usage(kind, payload):
     """Windows for one account, or None when it cannot be read."""
     if kind == "claude":
@@ -1301,13 +1755,34 @@ def fetch_usage(kind, payload):
         token, account_id, expires = _codex_auth(payload)
         if not token or (expires and expires < time.time()):
             return None
-        return _codex_windows(_http_json(CODEX_USAGE_URL, {
+        return _codex_usage_reading(_http_json(CODEX_USAGE_URL, {
             "Authorization": "Bearer %s" % token,
             "chatgpt-account-id": account_id or "",
             "User-Agent": "codex-cli",
             "Accept": "application/json",
         }))
     return None
+
+
+def _auth_error_code(exc):
+    """Return a known provider code only; never display its raw error message."""
+    if hasattr(exc, "_account_hub_error_code"):
+        return exc._account_hub_error_code
+    known = {"invalid_grant", "refresh_token_reused", "refresh_token_invalidated",
+             "refresh_token_expired", "token_revoked", "token_invalidated",
+             "invalid_token", "token_expired"}
+    code = None
+    try:
+        body = json.loads(exc.read(16384).decode() or "{}")
+        if isinstance(body, dict):
+            error = body.get("error")
+            values = ([error.get("code"), error.get("type")] if isinstance(error, dict)
+                      else [error]) + [body.get("code"), body.get("error_description")]
+            code = next((value for value in values if isinstance(value, str) and value in known), None)
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    exc._account_hub_error_code = code
+    return code
 
 
 def _refresh_refused(exc):
@@ -1322,15 +1797,8 @@ def _refresh_refused(exc):
         return False
     if exc.code == 401:
         return True
-    try:
-        body = json.loads(exc.read().decode() or "{}")
-    except Exception:
-        return False
-    said = " ".join(
-        str(body.get(field) or "")
-        for field in ("error", "error_description", "detail")
-    ).lower()
-    return "invalid_grant" in said or "reused" in said
+    return _auth_error_code(exc) in {"invalid_grant", "refresh_token_reused",
+                                    "refresh_token_invalidated", "refresh_token_expired"}
 
 
 def proven_payload(kind, profile):
@@ -1373,8 +1841,25 @@ def proven_payload(kind, profile):
             windows = fetch_usage(kind, payload)
         if windows:
             _remember_usage(key, windows)
+            _clear_login_problem(key)
     except urllib.error.HTTPError as exc:
         if exc.code == 401 or _refresh_refused(exc):
+            if kind == "codex":
+                reason = {
+                    "refresh_token_reused": "saved refresh token already used",
+                    "refresh_token_invalidated": "saved login revoked",
+                    "token_invalidated": "saved login revoked",
+                    "token_revoked": "saved login revoked",
+                    "refresh_token_expired": "saved login expired",
+                    "invalid_grant": "saved login no longer accepted",
+                }.get(_auth_error_code(exc), "saved login not accepted")
+                _record_login_problem(key, reason, _profile_by_id(kind, profile["id"])["payload"])
+                raise SwitchError(
+                    f"Codex: {label}: {reason} — active account unchanged; "
+                    "press a to sign in to this registration again"
+                ) from None
+            _record_login_problem(key, "saved login not accepted",
+                                  _profile_by_id(kind, profile["id"])["payload"])
             raise SwitchError(
                 "%s: %s was refused — nothing changed; log that account in "
                 "again and save it" % (kind, label)
@@ -1395,6 +1880,8 @@ def _remember_usage(key, windows):
     cache = _usage_cache()
     entry = cache.get(key) or {}
     now = time.time()
+    if isinstance(windows, UsageWindows):
+        entry.update(reset_credits=windows.reset_credits, reset_credits_at=now)
     # Stamp each window with the moment it was read. A rate worked out from a
     # cached reading has to be measured against that moment, not against a clock
     # that has kept running since — see _spend_rate.
@@ -1402,6 +1889,7 @@ def _remember_usage(key, windows):
                for w in (windows or [])]
     entry.update({"at": now, "windows": windows})
     entry.pop("retry_after", None)
+    entry.pop("problem", None)
     cache[key] = entry
     _secure_dir(STATE_DIR)
     _write_json_secret(USAGE_CACHE, cache)
@@ -1412,9 +1900,40 @@ def _rest_usage(key, seconds):
     cache = _usage_cache()
     entry = cache.get(key) or {}
     entry["retry_after"] = time.time() + seconds
+    entry["problem"] = "rate limited"
     cache[key] = entry
     _secure_dir(STATE_DIR)
     _write_json_secret(USAGE_CACHE, cache)
+
+
+def _usage_problem(key, problem):
+    """Keep a failed read visible when another UI tick reloads the cache."""
+    cache = _usage_cache()
+    entry = cache.get(key) or {}
+    entry["problem"] = problem
+    cache[key] = entry
+    _secure_dir(STATE_DIR)
+    _write_json_secret(USAGE_CACHE, cache)
+
+
+def _record_login_problem(key, reason, payload):
+    """A refused saved grant stays flagged even if another live grant reads usage."""
+    cache = _usage_cache()
+    entry = cache.get(key) or {}
+    entry.update(login_problem=reason, login_payload_hash=_codex_auth_hash(payload))
+    cache[key] = entry
+    _secure_dir(STATE_DIR)
+    _write_json_secret(USAGE_CACHE, cache)
+
+
+def _clear_login_problem(key):
+    cache = _usage_cache()
+    entry = cache.get(key) or {}
+    if "login_problem" in entry:
+        entry.pop("login_problem", None)
+        entry.pop("login_payload_hash", None)
+        cache[key] = entry
+        _write_json_secret(USAGE_CACHE, cache)
 
 
 def _usage_retry_delay(exc):
@@ -1430,7 +1949,7 @@ def _usage_retry_delay(exc):
     return seconds if 0 < seconds < float("inf") else USAGE_BACKOFF_S
 
 
-def usage_rows(kinds=None, refresh=True):
+def usage_rows(kinds=None, refresh=True, force=False):
     """Serialize cache checks and requests across picker/panel processes.
 
     Taking the lock before reading the cache means a waiting reader observes
@@ -1438,10 +1957,10 @@ def usage_rows(kinds=None, refresh=True):
     The same lock protects token renewal and switching, and is re-entrant.
     """
     with _Lock():
-        return _usage_rows(kinds, refresh)
+        return _usage_rows(kinds, refresh, force)
 
 
-def _usage_rows(kinds=None, refresh=True):
+def _usage_rows(kinds=None, refresh=True, force=False):
     """One row per saved profile: its windows, and how current they are.
 
     A parked profile usually holds an expired token, so its numbers come from
@@ -1458,24 +1977,37 @@ def _usage_rows(kinds=None, refresh=True):
         # without waiting for a switch.
         sync_live_profile(kind, live)
         current = active_profile(kind, live) if live else None
+        live_identity = _fingerprint(backend.identity(live)) if live else None
         for profile in list_profiles(kind):
             key = "%s:%s" % (kind, profile["id"])
             is_live = current is not None and profile["id"] == current["id"]
-            payload = live if is_live else profile.get("payload")
-            windows, state, problem = None, "unknown", None
+            # Fresh CLI sign-in can change the grant without changing the
+            # person/workspace. Read that account's usage with its live token,
+            # but never overwrite or select a registration just by identity.
+            from_live = bool(live_identity and live_identity == _fingerprint(profile["identity"]))
+            payload = live if from_live else profile.get("payload")
+            windows, state = None, "unknown"
             entry = cache.get(key) or {}
+            login_problem = (entry.get("login_problem")
+                             if entry.get("login_payload_hash") == _codex_auth_hash(profile.get("payload"))
+                             else None)
+            problem = entry.get("problem")
             # The endpoint rate-limits, so the live account observes the cache
             # too. It used to refetch on every call, which is what earns a 429.
             stale = (time.time() - (entry.get("at") or 0)) > USAGE_TTL_S
+            follow_up = entry.get("reset_usage_refresh") or {}
+            follow_up_due = bool(follow_up and time.time() >= follow_up["after"])
             resting = time.time() < (entry.get("retry_after") or 0)
             if resting:
                 problem = "rate limited"
-            if refresh and stale and not resting:
+            attempted_read = refresh and (stale or force or follow_up_due) and not resting
+            if attempted_read:
+                problem = None
                 try:
                     # A parked account's token has usually expired, so renewing
                     # is what makes its numbers readable at all. The live one is
                     # kept fresh by the CLI, so that chain is left alone.
-                    if USAGE_RENEW and not is_live:
+                    if USAGE_RENEW and not from_live:
                         payload = renew_profile(kind, profile) or payload
                     try:
                         windows = fetch_usage(kind, payload)
@@ -1484,7 +2016,7 @@ def _usage_rows(kinds=None, refresh=True):
                         # was superseded, which signing into another account on
                         # the same provider does. Renew past the clock and retry
                         # once — the server is the authority, not the expiry.
-                        if exc.code != 401 or is_live or not USAGE_RENEW:
+                        if exc.code != 401 or from_live or not USAGE_RENEW:
                             raise
                         payload = renew_profile(kind, profile, force=True)
                         if not payload:
@@ -1504,15 +2036,24 @@ def _usage_rows(kinds=None, refresh=True):
                     elif problem is None:
                         problem = "unreachable" if isinstance(
                             exc, urllib.error.URLError) else type(exc).__name__
+                    _usage_problem(key, problem)
                     windows = None
-            if windows:
+            if windows is not None:
                 state = "live"
                 _remember_usage(key, windows)
+                if not from_live or payload == profile.get("payload"):
+                    _clear_login_problem(key)
+                    login_problem = None
+                problem = None
                 at = time.time()
             elif entry.get("windows"):
                 windows, state, at = entry["windows"], "cached", entry.get("at")
             else:
                 windows, at = [], None
+            if attempted_read and follow_up_due:
+                _advance_reset_usage_refresh(key)
+            reset_entry = _usage_cache().get(key) or {}
+            next_read = (reset_entry.get("reset_usage_refresh") or {}).get("after")
             rows.append({
                 "kind": kind,
                 "id": profile["id"],
@@ -1523,9 +2064,226 @@ def _usage_rows(kinds=None, refresh=True):
                 "at": at,
                 "age": (time.time() - at) if at else None,
                 "windows": windows,
-                "problem": problem,
+                "problem": login_problem or problem,
+                "reset_credits": reset_entry.get("reset_credits"),
+                "reset_credits_at": reset_entry.get("reset_credits_at"),
+                "refresh_after": max(next_read, reset_entry.get("retry_after") or 0)
+                                 if next_read is not None else None,
             })
     return rows
+
+
+# ---- earned Codex resets ---------------------------------------------------
+# Use the same per-account HTTP/auth/cache path as usage. These routes and wire
+# fields are those of the official Codex backend-client (rust-v0.162.0), behind
+# account/rateLimits/read and account/rateLimitResetCredit/consume. No shared
+# daemon login or machine account switch is needed to redeem a parked account.
+CODEX_RESETS_URL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
+RESET_ATTEMPTS = os.path.join(STATE_DIR, "reset-attempts.json")
+RESET_USAGE_REFRESH_DELAYS_S = (2, 5, 10)
+
+
+def _queue_reset_usage_refresh(key):
+    cache = _usage_cache()
+    entry = cache.setdefault(key, {})
+    entry["reset_usage_refresh"] = {
+        "after": time.time() + RESET_USAGE_REFRESH_DELAYS_S[0],
+        "remaining_delays": list(RESET_USAGE_REFRESH_DELAYS_S[1:]),
+    }
+    _write_json_secret(USAGE_CACHE, cache)
+
+
+def _advance_reset_usage_refresh(key):
+    """Bound follow-up reads; cache-only calls never advance or query anything."""
+    cache = _usage_cache()
+    entry = cache.get(key) or {}
+    follow_up = entry.get("reset_usage_refresh")
+    if not follow_up:
+        return
+    delays = follow_up["remaining_delays"]
+    if delays:
+        follow_up["after"] = time.time() + delays.pop(0)
+    else:
+        entry.pop("reset_usage_refresh")
+    _write_json_secret(USAGE_CACHE, cache)
+
+
+def _reset_request(profile, url, body=None):
+    """Authenticated request for exactly this registration; no account fallback."""
+    backend = BACKENDS["codex"]
+    live = backend.read_live()
+    sync_live_profile("codex", live)
+    profile = _profile_by_id("codex", profile["id"])
+    identity = backend.identity(profile["payload"])
+    from_live = bool(live and (identity.get("user_id") or identity.get("email"))
+                     and _fingerprint(identity) == _fingerprint(backend.identity(live)))
+    payload = live if from_live else profile["payload"]
+    key = "codex:" + profile["id"]
+    try:
+        if not from_live and USAGE_RENEW:
+            payload = renew_profile("codex", profile) or payload
+        for attempt in range(2):
+            token, account_id, expiry = _codex_auth(payload)
+            if not token or not account_id:
+                raise SwitchError("Earned resets require a ChatGPT Codex login")
+            if expiry and expiry <= time.time():
+                raise SwitchError("Codex login expired; press 'a' to sign in again")
+            try:
+                headers = {
+                    "Authorization": "Bearer " + token,
+                    "chatgpt-account-id": account_id,
+                    "User-Agent": "codex-cli", "Accept": "application/json",
+                }
+                return (_http_json(url, headers, body) if body is not None
+                        else _http_json(url, headers))
+            except urllib.error.HTTPError as exc:
+                if exc.code != 401 or from_live or not USAGE_RENEW or attempt:
+                    raise
+                renewed = renew_profile("codex", profile, force=True)
+                if not renewed:
+                    raise
+                payload = renewed
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401 or _refresh_refused(exc):
+            saved = _profile_by_id("codex", profile["id"])["payload"]
+            if not from_live or payload == saved:
+                _record_login_problem(key, "saved login not accepted", saved)
+            raise SwitchError("Codex sign-in required; press 'a' to sign in again") from None
+        if exc.code == 429:
+            _rest_usage(key, _usage_retry_delay(exc))
+        raise SwitchError(f"Reset request refused (HTTP {exc.code}); press 't' to retry") from None
+    except (OSError, ValueError) as exc:
+        raise SwitchError("Reset service unreachable; press 't' to retry") from exc
+
+
+def _cache_resets(profile_id, summary, problem=None):
+    cache = _usage_cache()
+    entry = cache.setdefault("codex:" + profile_id, {})
+    entry.update(reset_credits=summary, reset_credits_at=time.time())
+    if problem:
+        entry["problem"] = problem
+    _write_json_secret(USAGE_CACHE, cache)
+
+
+def prepare_reset(kind, profile_id):
+    """Read before confirmation; choose earliest expiry, random among ties.
+
+    A pending redemption survives process exit and takes priority over any
+    fresh credit: retry it with its original key, never spend another by guess.
+    """
+    if kind != "codex":
+        raise SwitchError("Earned resets are available for Codex accounts only")
+    with _Lock():
+        profile = _profile_by_id(kind, profile_id)
+        fingerprint = _fingerprint(BACKENDS[kind].identity(profile["payload"]))
+        previous = (_read_json(RESET_ATTEMPTS) or {}).get(profile_id) or {}
+        if previous.get("status") == "pending":
+            if previous.get("fingerprint") != fingerprint:
+                raise SwitchError("An unconfirmed reset belongs to a different login")
+            return previous
+        body = _reset_request(profile, CODEX_RESETS_URL)
+        summary = _reset_summary(body)
+        _cache_resets(profile_id, summary)
+        if summary is None:
+            raise SwitchError("Reset availability unknown; press 't' to retry")
+        if not summary["available_count"]:
+            raise SwitchError("No resets available for this account.")
+        credits = body.get("credits")
+        if not isinstance(credits, list):
+            raise SwitchError("Reset expiry details unavailable; press 't' to retry")
+        # The provider may cap detail rows. Do not claim to choose the earliest
+        # expiry when some credits have no returned details.
+        ids = {c.get("id") for c in credits if isinstance(c, dict)
+               and isinstance(c.get("id"), str) and c["id"]}
+        if len(ids) < summary["available_count"]:
+            raise SwitchError("Reset details incomplete; cannot determine earliest expiry")
+        available = {}
+        for credit in credits:
+            if (not isinstance(credit, dict) or not isinstance(credit.get("id"), str)
+                    or credit["id"] not in ids
+                    or credit.get("reset_type") != "codex_rate_limits"
+                    or credit.get("status") != "available"):
+                continue
+            raw_expiry = credit.get("expires_at")
+            expiry = _iso_epoch(raw_expiry)
+            if raw_expiry is not None and (expiry is None or not float('-inf') < expiry < float('inf')):
+                raise SwitchError("Reset expiry unavailable; press 't' to retry")
+            if expiry is not None and expiry <= time.time():
+                continue
+            available[credit["id"]] = {"id": credit["id"], "expires_at": expiry}
+        if not available:
+            raise SwitchError("No resets available for this account.")
+        nearest = min(c["expires_at"] if c["expires_at"] is not None else float("inf")
+                      for c in available.values())
+        chosen = random.choice([c for c in available.values()
+                                if (c["expires_at"] if c["expires_at"] is not None
+                                    else float("inf")) == nearest])
+        return {"profile_id": profile_id, "fingerprint": fingerprint,
+                "credit": chosen, "request_id": str(uuid.uuid4()),
+                "previous_id": previous.get("request_id")}
+
+
+def consume_reset(attempt):
+    """Redeem the confirmed credit, journal first, then refresh provider values."""
+    with _Lock():
+        profile_id = attempt["profile_id"]
+        profile = _profile_by_id("codex", profile_id)
+        if attempt["fingerprint"] != _fingerprint(BACKENDS["codex"].identity(profile["payload"])):
+            raise SwitchError("Account changed; press 't' to check resets again")
+        journal = _read_json(RESET_ATTEMPTS) or {}
+        previous = journal.get(profile_id) or {}
+        same = previous.get("request_id") == attempt["request_id"]
+        if same and previous.get("status") == "resolved":
+            return _reset_result(previous["outcome"])
+        key = "codex:" + profile_id
+        if not same:
+            if previous.get("request_id") != attempt.get("previous_id"):
+                raise SwitchError("Another reset attempt changed this account; press 't' again")
+            expiry = attempt["credit"]["expires_at"]
+            if expiry is not None and expiry <= time.time():
+                raise SwitchError("Reset expired during confirmation; press 't' to check again")
+            journal[profile_id] = dict(attempt, status="pending")
+            # Disk failure here prevents the outbound request. An unknown
+            # response retains this same key across retry/restart/reauth.
+            _write_json_secret(RESET_ATTEMPTS, journal)
+        try:
+            response = _reset_request(profile, CODEX_RESETS_URL + "/consume", {
+                "credit_id": attempt["credit"]["id"],
+                "redeem_request_id": attempt["request_id"],
+            })
+            outcome = response.get("code")
+            if outcome not in ("reset", "already_redeemed", "nothing_to_reset", "no_credit"):
+                raise SwitchError("Unexpected reset service response")
+        except Exception as exc:
+            _cache_resets(profile_id, None, "reset result unconfirmed")
+            detail = str(exc) if isinstance(exc, SwitchError) else "Reset service unreachable"
+            raise SwitchError("Reset not confirmed; press 't' to retry the same reset. " + detail) from None
+        journal[profile_id].update(status="resolved", outcome=outcome)
+        try:
+            _write_json_secret(RESET_ATTEMPTS, journal)
+        except OSError:
+            return _reset_result(outcome) + "; receipt not saved; press 't' to confirm the same reset"
+        # Never decrement counts or zero percentages speculatively. Invalidate
+        # old values and read the account again, as the official API prescribes.
+        try:
+            if outcome in ("reset", "already_redeemed"):
+                # Usage windows can publish independently. Recheck a bounded
+                # number of times even if one window has already changed.
+                _queue_reset_usage_refresh(key)
+            _cache_resets(profile_id, None, "usage refresh required")
+            reading = _codex_usage_reading(_reset_request(profile, CODEX_USAGE_URL))
+            _remember_usage(key, reading)
+        except Exception:
+            if (_usage_cache().get(key) or {}).get("reset_usage_refresh"):
+                return _reset_result(outcome) + "; usage will refresh automatically"
+            return _reset_result(outcome) + "; press 'r' to refresh usage"
+        return _reset_result(outcome)
+
+
+def _reset_result(outcome):
+    return {"reset": "Reset applied", "already_redeemed": "Reset already applied",
+            "nothing_to_reset": "No eligible usage window to reset; no reset used",
+            "no_credit": "No resets available; no reset used"}[outcome]
 
 
 def _left(seconds):
@@ -1551,90 +2309,7 @@ def _age(seconds):
     return "%s ago" % _left(seconds)
 
 
-# ---- badges ---------------------------------------------------------------
-
-def badge_window(row):
-    """The current five-hour session usage, regardless of other limits."""
-    return next((w for w in shown_windows(row)
-                 if (w.get("label") or "").lower()
-                 in ("session", "five_hour", "5h")
-                 and isinstance(w.get("percent"), (int, float))), None)
-
-
-def account_labels(kinds=None, include_usage=False):
-    """{kind: label} for the kinds worth naming. One saved profile is enough.
-
-    Saving a profile is the signal that you care which account is in use, and
-    the badge earns its space straight away: with one profile it still says
-    whether the live login is that profile or something else.
-    """
-    labels = {}
-    for kind in kinds or KIND_ORDER:
-        if not list_profiles(kind) and not BADGE_ALWAYS:
-            continue
-        backend = BACKENDS[kind]
-        live = backend.read_live()
-        if live is None:
-            labels[kind] = "logged out"
-            continue
-        current = active_profile(kind, live)
-        if current:
-            labels[kind] = current["label"]
-            if include_usage:
-                entry = _usage_cache().get("%s:%s" % (kind, current["id"])) or {}
-                window = badge_window(entry)
-                if window:
-                    stale = (not entry.get("at") or usage_notice(entry)
-                             or time.time() < (entry.get("retry_after") or 0))
-                    labels[kind] = "%s %s%d%%" % (
-                        labels[kind], "~" if stale else "", round(window["percent"]))
-        else:
-            # Logged into something no profile has a copy of. Name it from the
-            # live identity and mark it, rather than showing a bare "?".
-            labels[kind] = (
-                default_label(kind, backend.identity(live) or {}) + UNSAVED_MARK
-            )
-    return labels
-
-
-def _names_agent(fmt):
-    """True when a badge format names the agent itself.
-
-    A format that says which agent it is needs no prefix in front of it.
-    """
-    return bool(re.search(r"\{(agent|title)[!:}]", fmt or ""))
-
-
-def _format_badge(name, kind=None):
-    backend = BACKENDS.get(kind) if kind else None
-    fields = {
-        "glyph": GLYPH,
-        "name": name,
-        "agent": (backend.short if backend else "") or kind or "",
-        "title": (backend.title if backend else "") or kind or "",
-    }
-    try:
-        return BADGE_FORMAT.format(**fields)
-    except (KeyError, IndexError, ValueError):
-        # A format naming a field that does not exist must not blank the badge.
-        return "{glyph} {name}".format(**fields)
-
-
-def _set_badge(pane_id, text):
-    herdr(
-        "pane", "report-metadata", pane_id,
-        "--source", PLUGIN_ID,
-        "--token", f"{TOKEN}={text}",
-    )
-
-
-def _clear_badge(pane_id):
-    herdr(
-        "pane", "report-metadata", pane_id,
-        "--source", PLUGIN_ID,
-        "--clear-token", TOKEN,
-    )
-
+# ---- credential synchronization -----------------------------------------
 
 def sync_live_profile(kind, live=None):
     """Sync token rotation only into the selected UUID. Never discover or
@@ -1661,30 +2336,6 @@ def sync_live_profile(kind, live=None):
         profile["saved_at"] = int(time.time())
         write_profile(profile)
     return True
-
-
-def stamp_badges():
-    """Label every claude/codex pane with the account it is currently using.
-
-    Credentials are machine-wide per kind, so this is the same value on every
-    pane of that kind — it is there so you can see, at a glance in the sidebar,
-    which account the fleet is burning. Panes opened later get stamped on the
-    next switch, startup, or picker refresh.
-    """
-    if not BADGE:
-        return
-    agents = live_agents()
-    if agents is None:
-        return
-    labels = account_labels()
-    for pane_id, info in agents.items():
-        kind = kind_of_agent(info)
-        if kind is None:
-            continue
-        if kind in labels:
-            _set_badge(pane_id, _format_badge(labels[kind], kind))
-        else:
-            _clear_badge(pane_id)
 
 
 # ---- kind resolution ------------------------------------------------------
@@ -1736,7 +2387,6 @@ def resolve_kind(explicit=None):
 # ---- commands -------------------------------------------------------------
 
 def cmd_open(argv):
-    stamp_badges()
     res = herdr(
         "plugin", "pane", "open",
         "--plugin", PLUGIN_ID,
@@ -1745,18 +2395,6 @@ def cmd_open(argv):
     )
     if res.returncode != 0:
         sys.stderr.write(res.stderr or "account-hub: failed to open picker\n")
-    return res.returncode
-
-
-def cmd_open_usage(argv):
-    res = herdr(
-        "plugin", "pane", "open",
-        "--plugin", PLUGIN_ID,
-        "--entrypoint", "usage",
-        "--placement", "overlay",
-    )
-    if res.returncode != 0:
-        sys.stderr.write(res.stderr or "account-hub: failed to open usage\n")
     return res.returncode
 
 
@@ -1775,17 +2413,18 @@ def cmd_switch(argv):
 
 
 def save_live(kind, label=None):
-    """Snapshot the live login of one kind. Returns a status string."""
+    """Save a live account only when it is absent; never reauthenticate it."""
     backend = BACKENDS[kind]
     with _Lock():
         live = backend.read_live()
         if live is None:
             raise SwitchError(f"{kind}: nothing logged in to save")
+        if _live_account_saved(kind, live):
+            return "Account already saved"
         identity = backend.identity(live)
         profile = make_profile(kind, label or default_label(kind, identity), live)
         write_profile(profile)
         _select_profile(kind, profile["id"])
-    stamp_badges()
     return (f"{kind}: saved {profile['label']} [{profile['id']}] "
             f"({backend.describe(profile['identity'])})")
 
@@ -1808,7 +2447,6 @@ def reauthenticate(kind, profile_id):
             _clear_staged(kind, profile["slug"])
         _forget_profile_usage(kind, profile_id)
         _select_profile(kind, profile_id)
-    stamp_badges()
     return f"{kind}: reauthenticated {profile['label']} [{profile_id}]"
 
 
@@ -1816,6 +2454,117 @@ def cmd_reauth(argv):
     if len(argv) != 2:
         raise SwitchError("usage: switcher.py reauth <claude|codex> <uuid>")
     print(reauthenticate(resolve_kind(argv[0]), argv[1]))
+    return 0
+
+
+LOGIN_TIMEOUT_S = 15 * 60
+
+
+def _run_official_login(kind, argv, environment, directory):
+    """Wait for the official CLI to finish, with bounded cancellation/timeout."""
+    title = BACKENDS[kind].short
+    try:
+        result = subprocess.run(argv, env=environment, cwd=directory, check=False,
+                                timeout=LOGIN_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        raise SwitchError(f"{title} sign-in timed out after 15 minutes; current account unchanged") from None
+    except KeyboardInterrupt:
+        raise SwitchError(f"{title} sign-in cancelled; current account unchanged") from None
+    except OSError:
+        raise SwitchError(f"Could not start {title} sign-in; check that its CLI is installed") from None
+    if result.returncode:
+        raise SwitchError(f"{title} sign-in did not complete; current account unchanged")
+
+
+def login_codex(profile_id=None, label=None, browser=False):
+    """Official sign-in in an empty, temporary credential store.
+
+    `codex login` revokes an existing login before starting. Never seed the
+    temporary home with saved/current auth, and never launch chats in it.
+    Only the resulting credentials enter this registration's own profile.
+    """
+    before = _profile_by_id("codex", profile_id) if profile_id else None
+    _secure_dir(STATE_DIR)
+    with tempfile.TemporaryDirectory(prefix="codex-login-", dir=STATE_DIR) as directory:
+        environment = _codex_environment()
+        environment["CODEX_HOME"] = directory
+        environment["CODEX_SQLITE_HOME"] = directory
+        argv = [CODEX, "login", "-c", 'cli_auth_credentials_store="file"']
+        if not browser:
+            argv.append("--device-auth")
+        _run_official_login("codex", argv, environment, directory)
+        auth = _read_json(os.path.join(directory, "auth.json"))
+        if not isinstance(auth, dict) or not (auth.get("tokens") or {}).get("access_token"):
+            raise SwitchError("Codex did not save a ChatGPT login; current account unchanged")
+        payload = {"auth": auth}
+        identity = BACKENDS["codex"].identity(payload)
+        if not identity.get("user_id") or not identity.get("account_id"):
+            raise SwitchError("Cannot identify the signed-in account; registration unchanged")
+        if before and any(before["identity"].get(key) != identity.get(key)
+                          for key in ("user_id", "account_id")):
+            raise SwitchError("Signed in to another person or workspace; selected registration unchanged")
+        with _Lock():
+            if before:
+                profile = _profile_by_id("codex", profile_id)
+                if profile.get("payload") != before.get("payload"):
+                    raise SwitchError("Registration changed during sign-in; retry after checking it")
+                _backup("codex", profile["payload"])
+                profile.update(payload=payload, identity=identity,
+                               fingerprint=_fingerprint(identity), saved_at=int(time.time()))
+                write_profile(profile)
+                _clear_staged("codex", profile_id)
+                if profile["slug"] != profile_id:
+                    _clear_staged("codex", profile["slug"])
+                _forget_profile_usage("codex", profile_id)
+            else:
+                profile = make_profile("codex", label or default_label("codex", identity), payload)
+                write_profile(profile)
+    return f"Codex: saved login for {profile['label']}; Enter applies it to this machine"
+
+
+def login_claude(label=None):
+    """Beta: collect a claude.ai login in an empty file-backed config folder."""
+    # The CLI scopes Keychain entries to CLAUDE_CONFIG_DIR on macOS. Do not read
+    # the shared service or guess the CLI's private service-name derivation.
+    if IS_MAC:
+        raise SwitchError("Automatic Claude sign-in is not supported on macOS yet (beta); use s to save an existing login")
+    _secure_dir(STATE_DIR)
+    with tempfile.TemporaryDirectory(prefix="claude-login-", dir=STATE_DIR) as directory:
+        environment = os.environ.copy()
+        environment["CLAUDE_CONFIG_DIR"] = directory
+        for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"):
+            environment.pop(name, None)
+        argv = [_setting("ACCOUNT_HUB_CLAUDE_BIN") or "claude", "auth", "login", "--claudeai"]
+        _run_official_login("claude", argv, environment, directory)
+        credentials = _read_json(os.path.join(directory, ".credentials.json"))
+        settings = _read_json(os.path.join(directory, ".claude.json"))
+        oauth = credentials.get("claudeAiOauth") if isinstance(credentials, dict) else None
+        account = settings.get("oauthAccount") if isinstance(settings, dict) else None
+        if not isinstance(oauth, dict) or not oauth.get("accessToken"):
+            raise SwitchError("Claude did not save a subscription login; current account unchanged")
+        if not isinstance(account, dict):
+            raise SwitchError("Cannot identify the signed-in Claude account; registration unchanged")
+        payload = {"store": "file", "credentials": credentials,
+                   "oauth_account": account}
+        identity = BACKENDS["claude"].identity(payload)
+        if not identity.get("account_id") or not identity.get("email"):
+            raise SwitchError("Cannot identify the signed-in Claude account; registration unchanged")
+        with _Lock():
+            profile = make_profile("claude", label or default_label("claude", identity), payload)
+            write_profile(profile)
+    return f"Claude: saved login for {profile['label']}; Enter applies it"
+
+
+def cmd_codex_login(argv):
+    browser = "--browser" in argv
+    args = [arg for arg in argv if arg != "--browser"]
+    if args and args[0] == "--label" and len(args) == 2:
+        message = login_codex(label=args[1], browser=browser)
+    elif len(args) <= 1:
+        message = login_codex(profile_id=args[0] if args else None, browser=browser)
+    else:
+        raise SwitchError("usage: switcher.py codex-login [profile-uuid | --label name] [--browser]")
+    print(message)
     return 0
 
 
@@ -1851,6 +2600,8 @@ def cmd_status(argv):
         else:
             desc = backend.describe(backend.identity(live))
             current = f"{active['label']} ({desc})" if active else f"unsaved ({desc})"
+        if kind == "codex":
+            current += "; " + codex_application_status()
         print(f"{backend.title:<12} {current}")
         for p in profiles:
             mark = "*" if active is not None and p["id"] == active["id"] else " "
@@ -1889,6 +2640,7 @@ def cmd_list(argv):
             "slug": row["slug"],
             "label": row["label"],
             "active": row["active"],
+            "active_source": "credential_store",
             "saved_at": profile.get("saved_at"),
             "last_used": profile.get("last_used"),
             "tier": (profile.get("identity") or {}).get("subscription_type"),
@@ -1918,82 +2670,14 @@ def _usage_pairs(curses):
             pairs[name] = curses.color_pair(index)
         except curses.error:
             pairs[name] = 0
+    try:
+        # Account failures are always red, independently of the usage palette.
+        index = len(USAGE_COLORS) + 1
+        curses.init_pair(index, curses.COLOR_RED, -1)
+        pairs["error"] = curses.color_pair(index)
+    except curses.error:
+        pairs["error"] = 0
     return pairs
-
-
-def cmd_usage_ui(argv):
-    """Coloured usage panel: every saved profile, every window it reports."""
-    import curses
-
-    def run(stdscr):
-        curses.curs_set(0)
-        pairs = _usage_pairs(curses)
-        # Reading two accounts is a network round trip, so refresh on a timer
-        # rather than on every keypress.
-        stdscr.timeout(2000)
-        rows, fetched = usage_rows(), time.time()
-        while True:
-            rows = usage_rows(refresh=False)
-            stdscr.erase()
-            height, width = stdscr.getmaxyx()
-            stdscr.addnstr(0, 0, "USAGE", width - 1, curses.A_BOLD)
-            stdscr.addnstr(
-                1, 0, "r refresh · q quit · read %s"
-                % _age(time.time() - fetched), width - 1, curses.A_DIM,
-            )
-            y = 3
-            for kind in KIND_ORDER:
-                mine = [r for r in rows if r["kind"] == kind]
-                if not mine or y >= height - 1:
-                    continue
-                stdscr.addnstr(y, 0, BACKENDS[kind].title, width - 1,
-                               curses.A_BOLD | curses.A_UNDERLINE)
-                y += 1
-                for row in mine:
-                    if y >= height - 1:
-                        break
-                    head = "%s %s" % ("●" if row["active"] else " ", row["label"])
-                    if row["state"] != "live":
-                        head += "   %s" % _age(row["age"])
-                    stdscr.addnstr(y, 2, head, width - 3,
-                                   curses.A_BOLD if row["active"] else curses.A_DIM)
-                    y += 1
-                    if not row["windows"]:
-                        stdscr.addnstr(y, 6, "never read", width - 7, curses.A_DIM)
-                        y += 1
-                    for window in row["windows"]:
-                        if y >= height - 1:
-                            break
-                        percent = window.get("percent")
-                        live = row["state"] == "live"
-                        sev = severity_of(percent if live else None)
-                        resets = window.get("resets_at")
-                        left = _left(resets - time.time()) if resets else "—"
-                        attr = pairs.get(sev, 0) | (0 if live else curses.A_DIM)
-                        stdscr.addnstr(
-                            y, 6,
-                            "%-14s %s %4s%%  %s" % (
-                                window.get("label", "window"),
-                                bar_for(percent),
-                                "?" if percent is None else round(percent),
-                                left,
-                            ),
-                            width - 7, attr,
-                        )
-                        y += 1
-                y += 1
-            stdscr.refresh()
-            try:
-                key = stdscr.getch()
-            except KeyboardInterrupt:
-                return
-            if key in (ord("q"), 27):
-                return
-            if key == ord("r") or time.time() - fetched >= USAGE_TTL_S:
-                rows, fetched = usage_rows(), time.time()
-
-    curses.wrapper(run)
-    return 0
 
 
 ANSI_OFF = "\033[0m"
@@ -2058,120 +2742,13 @@ def cmd_usage(argv):
     return 0
 
 
-def refresh_stable_link():
-    """Point STATE_DIR/current at wherever this copy of the plugin lives.
-
-    Replaced atomically, so a `tab_bar_right` or status-line command reading
-    through it never sees a missing path mid-update.
-    """
-    try:
-        # A link to itself is unreadable and unrecoverable from the outside,
-        # so refuse it outright rather than trusting the caller's path.
-        if os.path.abspath(STABLE_LINK) == ROOT:
-            return None
-        if os.path.realpath(STABLE_LINK) == ROOT:
-            return STABLE_LINK
-        _secure_dir(STATE_DIR)
-        tmp = STABLE_LINK + ".tmp"
-        if os.path.islink(tmp) or os.path.exists(tmp):
-            os.remove(tmp)
-        os.symlink(ROOT, tmp)
-        os.replace(tmp, STABLE_LINK)
-        return STABLE_LINK
-    except OSError:
-        return None  # a badge is not worth failing a startup hook over
-
-
-def cmd_stamp(argv):
-    refresh_stable_link()
-    stamp_badges()
-    warn_if_unwired()
-    return 0
-
-
-def _badge_refresh_due(kinds):
-    """Active saved logins whose usage or last attempt has aged out."""
-    cache = _usage_cache()
-    now = time.time()
-    for kind in kinds:
-        live = BACKENDS[kind].read_live()
-        profile = active_profile(kind, live) if live else None
-        if not profile:
-            continue
-        key = "%s:%s" % (kind, profile["id"])
-        entry = cache.get(key) or {}
-        last = max(entry.get("at") or 0, entry.get("badge_attempt_at") or 0)
-        if now - last > USAGE_TTL_S and now >= (entry.get("retry_after") or 0):
-            yield kind, key, live
-
-
-def cmd_badge_refresh(argv):
-    """Background reader; recheck identity and cache under the shared lock."""
-    kinds = [k for k in argv if k in BACKENDS] or KIND_ORDER
-    with _Lock():
-        for kind, key, live in _badge_refresh_due(kinds):
-            # Record attempts too: an outage or empty response must not cause
-            # another request on every tab-bar tick. Never renew a live login.
-            cache = _usage_cache()
-            entry = cache.setdefault(key, {})
-            entry["badge_attempt_at"] = time.time()
-            _secure_dir(STATE_DIR)
-            _write_json_secret(USAGE_CACHE, cache)
-            try:
-                windows = fetch_usage(kind, live)
-                if windows:
-                    _remember_usage(key, windows)
-            except urllib.error.HTTPError as exc:
-                if exc.code == 429:
-                    _rest_usage(key, _usage_retry_delay(exc))
-            except Exception:
-                pass  # Keep the last reading; retry at the next interval.
-    return 0
-
-
-def _schedule_badge_refresh(kinds):
-    if next(_badge_refresh_due(kinds), None) is None:
-        return
-    try:
-        subprocess.Popen(
-            [sys.executable, os.path.join(ROOT, "switcher.py"), "badge-refresh", *kinds],
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True,
-        )
-    except OSError:
-        pass  # A failed launch must not hide the account badge.
-
-
-def cmd_badge(argv):
-    """One line naming the live account(s), for `tab_bar_right`.
-
-    Credentials are machine-wide per kind, so the account is the same on every
-    pane. This prints it once for the tab bar instead of stamping every pane.
-    Prints cached usage immediately and schedules a refresh when it is due.
-    """
-    kinds = [k for k in argv if k in BACKENDS] or None
-    labels = account_labels(kinds, include_usage=True)
-    if not labels:
-        return 0
-    # Two accounts on one line need telling apart. Prefix them with the agent's
-    # name, unless the format already says which agent it is.
-    prefixed = len(labels) > 1 and not _names_agent(BADGE_FORMAT)
-    print(SEPARATOR.join(
-        ((BACKENDS[kind].short + " ") if prefixed else "")
-        + _format_badge(label, kind)
-        for kind, label in labels.items()
-    ), flush=True)
-    _schedule_badge_refresh(list(labels))
-    return 0
-
-
 # ---- overlay picker -------------------------------------------------------
 
 def _rows():
     """Display model: ("head", kind, text) / ("profile", kind, profile) /
     ("empty", kind, text). Only "profile" rows are selectable."""
     rows = []
-    for kind in KIND_ORDER:
+    for kind in ("codex", "claude"):
         backend = BACKENDS[kind]
         profiles = list_profiles(kind)
         if not backend.present() and not profiles:
@@ -2179,16 +2756,29 @@ def _rows():
         live = backend.read_live()
         current = active_profile(kind, live) if live else None
         head = backend.title
+        if kind == "claude":
+            head += " (beta)"
         if live is None:
             head += "  — not logged in"
         elif current is None:
-            head += f"  — live: {backend.describe(backend.identity(live))} (unsaved, press s)"
+            # A freshly authenticated grant may not belong to the selected
+            # registration yet. That does not make the person/workspace new.
+            # This is display-only: never select or overwrite a UUID by identity.
+            identity = backend.identity(live)
+            if not _live_account_saved(kind, live, profiles):
+                head += (f"  — live: {backend.describe(identity)} "
+                         "(press 's' to save this account)")
         rows.append(("head", kind, head))
+        label_counts = {}
+        for profile in profiles:
+            label_counts[profile["label"]] = label_counts.get(profile["label"], 0) + 1
         for p in profiles:
             p["_active"] = current is not None and p["id"] == current["id"]
+            if label_counts[p["label"]] > 1 and p.get("saved_at"):
+                p["_saved_hint"] = datetime.fromtimestamp(p["saved_at"], timezone.utc).strftime("%m-%d %H:%M UTC")
             rows.append(("profile", kind, p))
         if not profiles:
-            rows.append(("empty", kind, "  (nothing saved — press s to save the current login)"))
+            rows.append(("empty", kind, "  (nothing saved — press 's' to save the current login)"))
     if not rows:
         rows.append(("empty", None, "  no Claude Code or Codex install found"))
     return rows
@@ -2196,21 +2786,55 @@ def _rows():
 
 LABEL_W = 16
 USAGE_W = 20
+RESETS_W = 12
+RESETS_GAP = 4
 # Where the usage column starts: " " + mark + " " + label + " ".
 USAGE_COL = 3 + LABEL_W + 1
 
 
-def _profile_line(kind, p, width, usage=None):
+def _profile_line(kind, p, width, usage=None, problem=False, resets=None):
     backend = BACKENDS[kind]
-    mark = "●" if p.get("_active") else " "  # ●
+    mark = "!" if problem else ("●" if p.get("_active") else " ")
     desc = backend.describe(p.get("identity") or {})
+    if p.get("_saved_hint"):
+        desc = "saved " + p["_saved_hint"] + " | " + desc
     label = str(p["label"])[:LABEL_W]
+    if resets is not None:
+        desc = "%-*s %s" % (RESETS_W, resets[:RESETS_W], desc)
     if usage is None:
         line = " %s %-*s %s" % (mark, LABEL_W, label, desc)
     else:
-        line = " %s %-*s %-*s %s" % (
-            mark, LABEL_W, label, USAGE_W, usage[:USAGE_W], desc)
+        line = " %s %-*s %-*s%s%s" % (
+            mark, LABEL_W, label, USAGE_W, usage[:USAGE_W], " " * RESETS_GAP, desc)
     return line[: max(0, width - 1)]
+
+
+def reset_summary(kind, row):
+    if kind != "codex":
+        return ""
+    summary = _reset_summary((row or {}).get("reset_credits"))
+    if summary is None or (row or {}).get("problem"):
+        return "-"
+    at = (row or {}).get("reset_credits_at") or 0
+    old = time.time() - at > USAGE_TTL_S
+    count = summary["available_count"]
+    unit = "reset" if count <= 1 else "resets"
+    return f"{'~' if old else ''}{count} {unit}"
+
+
+def _picker_help(width):
+    # Keep add-new/use-reset together. Wrap complete actions rather than
+    # clipping the last shortcuts or splitting an action across two lines.
+    actions = ["'enter' switch", "'s' save current acc", "'a' sign in again", "'r' refresh",
+               "'g' rename", "'x' delete", "'d' details",
+               "'u' add new | 't' use reset", "'esc' quit"]
+    lines = []
+    for action in actions:
+        if lines and len(lines[-1]) + len(action) + 3 <= width:
+            lines[-1] += " | " + action
+        else:
+            lines.append(action)
+    return lines
 
 
 def summary_window(row):
@@ -2248,26 +2872,10 @@ SEVEN_DAYS = 7 * 86400
 # Spend this much of a window and its rate means something, however new it is.
 SETTLED_PERCENT = _num_env("ACCOUNT_HUB_SETTLED_PERCENT", 5.0)
 
-def _centred(text, width):
-    """A column title sitting over the middle of its column."""
-    if width <= len(text):
-        return text[:width]
-    pad = width - len(text)
-    return " " * (pad // 2) + text + " " * (pad - pad // 2)
-
-
-# One row per window, and the header built from the same widths so the two
-# cannot drift apart.
 DETAIL_FMT = "%-9s %3s%%  %s  %s"
-DETAIL_HEAD = "%s %s  %s  %s" % (
-    _centred("window", 9), _centred("used", 4), _centred("", 10), "at this rate")
-# The collapsed view's one-line summary: bar, percent, and the moment the window
-# is about to hand you.
+# The collapsed view's one-line summary: bar, percent, and automatic reset.
 SUMMARY_FMT = "%s %3d%% %s"
-SUMMARY_HEAD = "%s %s %s" % (
-    _centred("", 8), _centred("used", 4), "limit in")
-# The figure is the limit whenever there is one still ahead, so the title names
-# that, and a row showing a reset instead carries this.
+# Mark every known automatic reset countdown.
 RESET_MARK = "↺"
 
 
@@ -2389,8 +2997,8 @@ def shown_windows(row):
     Codex windows used to be reduced to the longest one, on the reasoning that
     the weekly figure was the one worth the space. It is not: the five-hour
     window is what stops you hour to hour, and dropping it meant a five-hour
-    window sitting at 100% was replaced on the badge by a roomy weekly number.
-    The badge then reported capacity on an account that had none.
+    window sitting at 100% was replaced in the picker by a roomy weekly number.
+    The picker then reported capacity on an account that had none.
     """
     return list((row or {}).get("windows") or [])
 
@@ -2438,7 +3046,7 @@ def usage_summary(row):
     """"How much is left" for one profile row, sized for the picker column.
 
     Only the binding window: which window that is, and the rest of them, is
-    what the usage panel is for.
+    what the expanded picker is for.
     """
     if row is None:
         return "", "stale"
@@ -2449,33 +3057,17 @@ def usage_summary(row):
     if not window:
         return "no windows", "stale"
     percent = window["percent"]
-    # Count down to whichever moment this window is about to hand you. While it
-    # is still filling that is when it fills, which is when work stops; the
-    # reset it used to show was a longer, softer number for the same window.
-    # Once it is spent the reset is the moment that matters, being when it lets
-    # you back in. A window with no rate to reason from has only its reset.
-    #
-    # A reset is any row the column title does not describe, so it is marked.
-    # Unmarked, an untouched account reads "0% 4h48" under "limit in" — a limit
-    # that is not coming. The question is whether a limit is still ahead, not
-    # which case this is: a window is also past one when its rate will not fill
-    # it before it resets, and when a cached reading's projected limit has gone
-    # by. The first of those is the commonest marked row of the four.
-    hits = time_to_limit(window)
-    if hits:
-        left = _left(hits)
-    else:
-        resets = window.get("resets_at")
-        left = (_left(resets - time.time()) + RESET_MARK) if resets else "—"
+    # The compact view always shows the automatic reset. Exhaustion estimates
+    # remain in projection(), used by the detailed view only.
+    resets = window.get("resets_at")
+    left = (_left(resets - time.time()) + RESET_MARK) if resets else "—"
     text = SUMMARY_FMT % (bar_for(percent, 8), round(percent), left)
     if notice:
         # Keep capacity useful during a reporting outage. The marker identifies
         # the last-known percentage; details carry its age and refresh error.
         # Borrow one bar cell so even ~100% leaves the reset column aligned.
         text = "%s %5s %s" % (bar_for(percent, 7), "~%d%%" % round(percent), left)
-    # A seven-day reset fills the column to its edge, so nothing reported today
-    # is cut. A longer tier would be, and the mark is what the slice takes
-    # first — leaving a reset reading as a limit, which is the defect above.
+    # Keep the reset marker visible if a longer countdown must be truncated.
     if len(text) > USAGE_W and text.endswith(RESET_MARK):
         text = text[:USAGE_W - 1] + RESET_MARK
     return text[:USAGE_W], severity_of(percent)
@@ -2497,7 +3089,7 @@ def _ask(stdscr, title, question, initial=""):
     """Centred one-field dialog. Returns the text, or None on esc."""
     import curses
 
-    hint = "enter confirm · esc cancel"
+    hint = "enter | esc"
     buf = list(initial)
     width = min(
         max(len(question), len(title), len(hint), 44) + 6, stdscr.getmaxyx()[1]
@@ -2529,10 +3121,10 @@ def _ask(stdscr, title, question, initial=""):
 
 
 def _confirm(stdscr, title, question, note=None):
-    """Centred yes/no dialog. Only `y` confirms; anything else cancels."""
+    """Centered confirmation. Only Enter confirms; Esc/other keys cancel."""
     import curses
 
-    hint = "y confirm · any other key cancel"
+    hint = "enter | esc"
     width = min(
         max(len(question), len(title), len(hint), len(note or ""), 44) + 6,
         stdscr.getmaxyx()[1],
@@ -2549,10 +3141,67 @@ def _confirm(stdscr, title, question, note=None):
             win.addnstr(4, 2, note, inner, curses.A_DIM)
         win.addnstr(height - 2, 2, hint, inner, curses.A_DIM)
         win.refresh()
-        return win.getch() in (ord("y"), ord("Y"))
+        return win.getch() in (curses.KEY_ENTER, 10, 13)
     finally:
         stdscr.touchwin()
         stdscr.refresh()
+
+
+def _choose(stdscr, title, options):
+    """Centered selection dialog: arrows/Enter choose, Esc cancels."""
+    import curses
+    hint = "↑/↓ | enter | esc"
+    width = min(max(len(title), len(hint), *(len(label) for _, label in options)) + 6,
+                stdscr.getmaxyx()[1])
+    selected = 0
+    try:
+        while True:
+            win = _center_win(stdscr, len(options) + 6, width)
+            win.erase()
+            win.box()
+            inner = width - 4
+            win.addnstr(0, 2, " %s " % title, inner, curses.A_BOLD)
+            for index, (_, label) in enumerate(options):
+                win.addnstr(index + 2, 2, label.ljust(inner), inner,
+                            curses.A_REVERSE if index == selected else curses.A_NORMAL)
+            win.addnstr(len(options) + 4, 2, hint, inner, curses.A_DIM)
+            win.refresh()
+            ch = win.getch()
+            if ch == 27:
+                return None
+            if ch in (curses.KEY_ENTER, 10, 13):
+                return options[selected][0]
+            if ch in (curses.KEY_DOWN, ord("j")):
+                selected = min(selected + 1, len(options) - 1)
+            elif ch in (curses.KEY_UP, ord("k")):
+                selected = max(selected - 1, 0)
+    finally:
+        stdscr.touchwin()
+        stdscr.refresh()
+
+
+def _ui_login(stdscr, kind, profile_id=None, label=None):
+    """Give the terminal to official sign-in, then restore the account picker."""
+    import curses
+    curses.def_prog_mode()
+    curses.endwin()
+    try:
+        print("\nAccount Hub — sign in to " + BACKENDS[kind].short)
+        print("Complete the official login below. Current account stays active.")
+        print("Saved automatically | Ctrl+C cancels | 15-minute limit\n", flush=True)
+        if kind == "codex":
+            return login_codex(profile_id=profile_id, label=label,
+                               browser=_setting("ACCOUNT_HUB_CODEX_LOGIN_METHOD") == "browser")
+        return login_claude(label=label)
+    finally:
+        curses.reset_prog_mode()
+        curses.curs_set(0)
+        stdscr.touchwin()
+        stdscr.refresh()
+
+
+def _ui_codex_login(stdscr, profile_id=None, label=None):
+    return _ui_login(stdscr, "codex", profile_id=profile_id, label=label)
 
 
 def cmd_ui(argv):
@@ -2565,88 +3214,111 @@ def cmd_ui(argv):
         # on macOS that is a Keychain lookup per agent kind.
         stdscr.timeout(5000)
         sel = 0
+        selected_key = None
+        scroll = 0
         message = ""
         details = False
-        # Poll only at the cache interval; usage_rows also observes each
-        # account's Retry-After, including while this picker stays open.
-        usage = {"%s:%s" % (r["kind"], r["id"]): r for r in usage_rows()}
+        # Opening requests fresh usage, even if a recent cache lacks new fields.
+        # Later ticks follow the TTL or scheduled post-reset checks. Every read
+        # still observes each account's Retry-After.
+        usage = {"%s:%s" % (r["kind"], r["id"]): r for r in usage_rows(force=True)}
         usage_fetched = time.time()
+        usage_profiles = set(usage)
         while True:
-            if time.time() - usage_fetched >= USAGE_TTL_S:
+            rows = _rows()
+            profile_keys = {"%s:%s" % (kind, body["id"])
+                            for row_type, kind, body in rows if row_type == "profile"}
+            if (time.time() - usage_fetched >= USAGE_TTL_S
+                    or profile_keys != usage_profiles
+                    or any(r.get("refresh_after") is not None
+                           and time.time() >= r["refresh_after"] for r in usage.values())):
                 usage = {"%s:%s" % (r["kind"], r["id"]): r for r in usage_rows()}
                 usage_fetched = time.time()
+                usage_profiles = {"%s:%s" % (kind, body["id"])
+                                  for row_type, kind, body in rows if row_type == "profile"}
             else:
                 # Another switcher pane may already have fetched newer usage.
                 usage = {"%s:%s" % (r["kind"], r["id"]): r
                          for r in usage_rows(refresh=False)}
-            rows = _rows()
             pickable = [
                 i for i, r in enumerate(rows)
                 if r[0] == "profile" or (r[0] == "empty" and r[1])
             ]
+            keys = [(rows[i][1], rows[i][2]["id"] if rows[i][0] == "profile" else None)
+                    for i in pickable]
             if pickable:
-                sel = min(max(sel, 0), len(pickable) - 1)
+                sel = (keys.index(selected_key) if selected_key in keys
+                       else min(max(sel, 0), len(pickable) - 1))
+                selected_key = keys[sel]
             stdscr.erase()
             h, w = stdscr.getmaxyx()
-            stdscr.addnstr(0, 0, "ACCOUNTS", w - 1, curses.A_BOLD)
-            if h > 1:
-                # Padded: the text shortens when details are on, and addnstr
-                # leaves whatever the longer version wrote behind it.
-                stdscr.addnstr(
-                    1, 0,
-                    ("j/k select · enter switch · s save · a reauth · r rename · x delete · "
-                     "d %s · u reread · q quit"
-                     % ("hide" if details else "details")).ljust(w - 1),
-                    w - 1, curses.A_DIM,
-                )
-            # Column titles, so the numbers are not left to be guessed at.
-            if h > 2:
-                # Three spaces first: the profile line spends them on " ● ".
-                head = "   %s %s" % (
-                    _centred("account", LABEL_W),
-                    DETAIL_HEAD if details else SUMMARY_HEAD,
-                )
-                stdscr.addnstr(2, 0, head.ljust(w - 1), w - 1,
-                               curses.A_DIM | curses.A_UNDERLINE)
-            y = 4
+            count = len(profile_keys)
+            stdscr.addnstr(0, 0, "%d account%s" % (count, "" if count == 1 else "s"),
+                           w - 1, curses.A_BOLD)
+            help_lines = _picker_help(w - 1)[:max(0, h - 4)]
+            for y, text in enumerate(help_lines, start=1):
+                stdscr.addnstr(y, 0, text.ljust(w - 1), w - 1, curses.A_DIM)
+            navigation_y = 1 + len(help_lines)
+            list_y = navigation_y + 1
+            lines = []
+            selected_span = None
             for i, (kind_row, kind, body) in enumerate(rows):
-                if y >= h - 1:
-                    break
+                start = len(lines)
                 if kind_row == "head":
-                    stdscr.addnstr(y, 0, body, w - 1, curses.A_BOLD | curses.A_UNDERLINE)
+                    lines.append((body, curses.A_BOLD | curses.A_UNDERLINE, None, False))
                 elif kind_row == "empty":
                     is_sel = pickable and i == pickable[sel]
                     attr = curses.A_REVERSE if is_sel else curses.A_DIM
-                    stdscr.addnstr(y, 0, body.ljust(w - 1), w - 1, attr)
+                    lines.append((body, attr, None, False))
+                    if is_sel:
+                        selected_span = (start, len(lines))
                 else:
                     is_sel = pickable and i == pickable[sel]
                     row = usage.get("%s:%s" % (kind, body["id"]))
                     # Expanded, the windows below carry the numbers, so the
                     # account line would only repeat one of them.
                     text, sev = ("", "ok") if details else usage_summary(row)
-                    line = _profile_line(kind, body, w, text).ljust(w - 1)
-                    stdscr.addnstr(y, 0, line, w - 1,
-                                   curses.A_REVERSE if is_sel else curses.A_NORMAL)
-                    # Repaint just the usage column in its severity colour, so
-                    # the palette reads as "how full is this account", nothing
-                    # else. The column is at a fixed offset, not searched for.
-                    if text and not is_sel and w > USAGE_COL + 1:
-                        stdscr.addnstr(y, USAGE_COL, text[: w - 1 - USAGE_COL],
-                                       w - 1 - USAGE_COL, pairs.get(sev, 0))
+                    problem = bool(row and row.get("problem"))
+                    line = _profile_line(kind, body, w, text, problem=problem,
+                                         resets=reset_summary(kind, row)).ljust(w - 1)
+                    lines.append((line, curses.A_REVERSE if is_sel else curses.A_NORMAL,
+                                  (text, sev) if text and not is_sel else None, problem))
                     if details:
                         for line_text, line_sev in usage_detail(row):
-                            y += 1
-                            if y >= h - 1:
-                                break
-                            stdscr.addnstr(y, USAGE_COL, line_text,
-                                           w - 1 - USAGE_COL,
-                                           pairs.get(line_sev, 0))
-                        y += 1  # a blank line, or the accounts run together
-                y += 1
+                            lines.append((" " * USAGE_COL + line_text,
+                                          pairs.get(line_sev, 0), None, False))
+                    if is_sel:
+                        selected_span = (start, len(lines))
+                    if details:
+                        lines.append(("", curses.A_NORMAL, None, False))
+            available = max(0, h - 1 - list_y)
+            if available and selected_span:
+                start, end = selected_span
+                if start < scroll:
+                    scroll = start
+                elif end > scroll + available:
+                    scroll = min(start, end - available)
+            scroll = max(0, min(scroll, max(0, len(lines) - available)))
+            for y, (line, attr, coloured_usage, problem) in enumerate(
+                    lines[scroll:scroll + available], start=list_y):
+                stdscr.addnstr(y, 0, line.ljust(w - 1), w - 1, attr)
+                if problem and w > 2:
+                    stdscr.addnstr(y, 1, "!", 1, pairs.get("error", 0) | curses.A_BOLD)
+                if coloured_usage and w > USAGE_COL + 1:
+                    text, sev = coloured_usage
+                    stdscr.addnstr(y, USAGE_COL, text, w - 1 - USAGE_COL,
+                                   pairs.get(sev, 0))
+            if navigation_y < h - 1 and len(lines) > available:
+                navigation = "j/k scroll"
+                if scroll:
+                    navigation += " | ↑ more above"
+                if scroll + available < len(lines):
+                    navigation += " | ↓ more below"
+                stdscr.addnstr(navigation_y, 0, navigation, w - 1, curses.A_DIM)
             if message and h > 1:
                 stdscr.addnstr(h - 1, 0, message[: w - 1], w - 1, curses.A_BOLD)
             elif h > 1 and any(usage_notice(r) for r in usage.values()):
-                stdscr.addnstr(h - 1, 0, "~ last known usage · d details", w - 1, curses.A_DIM)
+                stdscr.addnstr(h - 1, 0, "~ last known usage | d details", w - 1, curses.A_DIM)
             stdscr.refresh()
 
             try:
@@ -2666,19 +3338,53 @@ def cmd_ui(argv):
 
             if ch in (ord("j"), curses.KEY_DOWN) and pickable:
                 sel = min(len(pickable) - 1, sel + 1)
+                selected_key = keys[sel]
             elif ch in (ord("k"), curses.KEY_UP) and pickable:
                 sel = max(0, sel - 1)
+                selected_key = keys[sel]
             elif ch in (curses.KEY_ENTER, 10, 13) and selected:
+                profile = selected[2]
+                if selected[1] == "codex" and not _confirm(
+                        stdscr, "Switch Codex account",
+                        f"Switch to {profile['label']} ?",
+                        "Reload open chats; keep history and titles."):
+                    message = "Account change cancelled"
+                    continue
                 try:
-                    message = switch(selected[1], selected[2]["id"])
+                    if selected[1] == "codex":
+                        title = "Switching Codex account and reloading chats..."
+                        note = "(Daemon may wait for active work)"
+                        progress = title + " " + note
+                        progress_lines = ([progress] if len(progress) < w else [title, note])[-h:]
+                        for index, line in enumerate(progress_lines):
+                            stdscr.addnstr(h - len(progress_lines) + index, 0,
+                                          line.ljust(w - 1), w - 1, curses.A_BOLD)
+                        stdscr.refresh()
+                    message = switch(selected[1], profile["id"])
                 except SwitchError as exc:
                     message = str(exc)
+            elif ch == ord("u"):
+                provider = _choose(stdscr, "Add new account",
+                                   [("codex", "Codex"), ("claude", "Claude (beta)")])
+                if provider is None:
+                    continue
+                title = "Add " + BACKENDS[provider].short + " account"
+                label = _ask(stdscr, title, "Name")
+                if label is not None and _confirm(
+                        stdscr, title, "Start official sign-in?"):
+                    try:
+                        message = _ui_login(stdscr, provider, label=label or None)
+                    except SwitchError as exc:
+                        message = str(exc)
             elif ch == ord("s") and kind:
-                ident = None
                 live = BACKENDS[kind].read_live()
-                if live is not None:
-                    ident = BACKENDS[kind].identity(live)
-                suggested = default_label(kind, ident) if ident else ""
+                if live is None:
+                    message = f"{kind}: nothing logged in to save"
+                    continue
+                if _live_account_saved(kind, live):
+                    message = "Account already saved"
+                    continue
+                suggested = default_label(kind, BACKENDS[kind].identity(live))
                 name = _ask(
                     stdscr, "Save profile", f"Name this {kind} login?", suggested
                 )
@@ -2687,7 +3393,7 @@ def cmd_ui(argv):
                         message = save_live(kind, name)
                     except SwitchError as exc:
                         message = str(exc)
-            elif ch == ord("r") and selected:
+            elif ch == ord("g") and selected:
                 name = _ask(
                     stdscr, "Rename profile",
                     f"New name for {selected[2]['label']}?", selected[2]["label"],
@@ -2701,6 +3407,16 @@ def cmd_ui(argv):
                         message = str(exc)
             elif ch == ord("a") and selected:
                 profile = selected[2]
+                if profile["kind"] == "codex":
+                    if _confirm(stdscr, "Sign in to Codex account",
+                                f"Sign in again to {profile['label']}?",
+                                "Use the official login. Apply with Enter afterwards."):
+                        try:
+                            message = _ui_codex_login(stdscr, profile_id=profile["id"])
+                            usage_fetched = 0
+                        except SwitchError as exc:
+                            message = str(exc)
+                    continue
                 live = BACKENDS[profile["kind"]].read_live()
                 desc = (BACKENDS[profile["kind"]].describe(
                     BACKENDS[profile["kind"]].identity(live)) if live else "logged out")
@@ -2711,17 +3427,49 @@ def cmd_ui(argv):
                         message = reauthenticate(profile["kind"], profile["id"])
                     except SwitchError as exc:
                         message = str(exc)
+            elif ch == ord("c"):
+                label = _ask(stdscr, "Add Codex account", "Name")
+                if label and _confirm(stdscr, "Add Codex account",
+                                      f"Sign in to add {label}?",
+                                      "Use the official login. Current account stays active."):
+                    try:
+                        message = _ui_codex_login(stdscr, label=label)
+                    except SwitchError as exc:
+                        message = str(exc)
             elif ch == ord("d"):
                 details = not details
-            elif ch == ord("u"):
-                message = "reading usage…"
+            elif ch == ord("t") and selected:
+                profile = selected[2]
+                try:
+                    stdscr.addnstr(h - 1, 0, "Checking resets...".ljust(w - 1),
+                                  w - 1, curses.A_BOLD)
+                    stdscr.refresh()
+                    attempt = prepare_reset(selected[1], profile["id"])
+                    expiry = attempt["credit"]["expires_at"]
+                    note = ("Expires: " + datetime.fromtimestamp(expiry, timezone.utc).strftime(
+                            "%Y-%m-%d %H:%M UTC") if expiry is not None else "Expires: not provided")
+                    if not _confirm(stdscr, "Use reset", f"Use a reset for {profile['label']} ?", note):
+                        message = "Reset cancelled"
+                        continue
+                    stdscr.addnstr(h - 1, 0, "Using reset...".ljust(w - 1),
+                                  w - 1, curses.A_BOLD)
+                    stdscr.refresh()
+                    message = consume_reset(attempt)
+                except SwitchError as exc:
+                    message = str(exc)
+                except OSError:
+                    message = "Cannot save reset state; result not confirmed. Press 't' to retry."
+            elif ch == ord("r"):
+                message = "refreshing accounts…"
                 stdscr.addnstr(h - 1, 0, message.ljust(w - 1), w - 1, curses.A_BOLD)
                 stdscr.refresh()
-                usage = {"%s:%s" % (r["kind"], r["id"]): r for r in usage_rows()}
+                usage = {"%s:%s" % (r["kind"], r["id"]): r for r in usage_rows(force=True)}
                 usage_fetched = time.time()
+                usage_profiles = set(usage)
                 stale = [r["label"] for r in usage.values() if r["state"] != "live"]
-                message = ("usage read" if not stale
-                           else "usage read; cached for " + ", ".join(stale))
+                message = "accounts refreshed"
+                if stale:
+                    message += "; cached for " + ", ".join(stale)
             elif ch == ord("x") and selected:
                 profile = selected[2]
                 # Deleting a profile removes this plugin's copy, never the
@@ -2741,329 +3489,28 @@ def cmd_ui(argv):
     return 0
 
 
-# ---- sidebar wiring -------------------------------------------------------
-
-SIDEBAR_TABLE = "[ui.sidebar.agents]"
-OVERRIDE_TABLE = "[ui.sidebar.agents.rows_by_agent]"
-DEFAULT_ROWS = '[["state_icon", "workspace", "tab"], ["agent"]]'
-CONFIG_BACKUP_DIR = os.path.join(STATE_DIR, "config-backups")
-NAG_MARKER = os.path.join(STATE_DIR, ".sidebar-nagged")
-_HEADER_RE = re.compile(r"\[\[?[^\[\]]+\]\]?\s*(#.*)?$")
-
-
-def config_path():
-    sock = os.environ.get("HERDR_SOCKET_PATH")
-    if sock:
-        guess = os.path.join(os.path.dirname(sock), "config.toml")
-        if os.path.exists(guess):
-            return guess
-    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
-    return os.path.join(base, "herdr", "config.toml")
-
-
-def _uncommented(text):
-    return "\n".join(l for l in text.splitlines() if not l.lstrip().startswith("#"))
-
-
-def _token_wired(text):
-    return '"${}"'.format(TOKEN) in _uncommented(text)
-
-
-def _match_brackets(text, i):
-    while i < len(text) and text[i] != "[":
-        if not text[i].isspace():
-            return None
-        i += 1
-    depth = 0
-    while i < len(text):
-        if text[i] == "[":
-            depth += 1
-        elif text[i] == "]":
-            depth -= 1
-            if depth == 0:
-                return i + 1
-        i += 1
-    return None
-
-
-def _find_value(text, header, key):
-    """Offsets of the `key = [...]` array inside `header`, or None.
-
-    Bracket depth is tracked so a row line such as `["agent"],` inside a
-    multi-line value is never mistaken for the next table header.
-    """
-    lines = text.splitlines(keepends=True)
-    start = None
-    for i, line in enumerate(lines):
-        if line.strip() == header:
-            start = i
-            break
-    if start is None:
-        return None
-    offset = sum(len(l) for l in lines[: start + 1])
-    depth = 0
-    for line in lines[start + 1 :]:
-        if depth == 0:
-            if _HEADER_RE.match(line.strip()):
-                return None
-            match = re.match(r"\s*%s\s*=\s*" % re.escape(key), line)
-            if match:
-                vstart = offset + match.end()
-                vend = _match_brackets(text, vstart)
-                return None if vend is None else (vstart, vend)
-        depth += line.count("[") - line.count("]")
-        offset += len(line)
-    return None
-
-
-def _append_token(value):
-    depth = 0
-    inner_open = None
-    for i, ch in enumerate(value):
-        if ch == "[":
-            depth += 1
-            if depth == 2:
-                inner_open = i
-        elif ch == "]":
-            if depth == 2 and inner_open is not None:
-                inner = value[inner_open + 1 : i].strip()
-                sep = ", " if inner else ""
-                return value[:i].rstrip() + '%s"$%s"' % (sep, TOKEN) + value[i:]
-            depth -= 1
-    return None
-
-
-def _drop_token(value):
-    """Remove every "$TOKEN" entry from a rows array, or None if absent."""
-    quoted = '"$%s"' % TOKEN
-    if quoted not in value:
-        return None
-    out = re.sub(r",\s*" + re.escape(quoted), "", value)
-    out = re.sub(re.escape(quoted) + r"\s*,\s*", "", out)
-    out = out.replace(quoted, "")
-    return out
-
-
-def _valid_toml(text):
-    """False only when tomllib is present and rejects the text."""
-    try:
-        import tomllib
-    except ImportError:
-        return True  # too old to check; the caller still keeps a backup
-    try:
-        tomllib.loads(text)
-        return True
-    except Exception:
-        return False
-
-
-def _stripped_config(text, kinds):
-    """(new text, [what changed]) on success, else (None, reason)."""
-    if not _token_wired(text):
-        return None, "already"
-    out, changed = text, []
-    for header, key in (
-        [(SIDEBAR_TABLE, "rows")] + [(OVERRIDE_TABLE, k) for k in kinds]
-    ):
-        span = _find_value(out, header, key)
-        if not span:
-            continue
-        dropped = _drop_token(out[span[0] : span[1]])
-        if dropped is None:
-            continue
-        out = out[: span[0]] + dropped + out[span[1] :]
-        changed.append("rows" if key == "rows" else "rows_by_agent.%s" % key)
-    if not changed:
-        return None, "unparsed"
-    return out, changed
-
-
-def _merged_config(text, kinds):
-    """(new text, [what changed]) on success, else (None, reason).
-
-    An override in rows_by_agent replaces rows rather than extending it, so a
-    kind listed there needs the token merged into its own layout too.
-    """
-    if _token_wired(text):
-        return None, "already"
-    out, changed = text, []
-    span = _find_value(out, SIDEBAR_TABLE, "rows")
-    if span:
-        merged = _append_token(out[span[0] : span[1]])
-        if merged is None:
-            return None, "unparsed"
-        out = out[: span[0]] + merged + out[span[1] :]
-        changed.append("rows")
-    elif SIDEBAR_TABLE in _uncommented(out):
-        return None, "unparsed"
-    else:
-        block = "%s\nrows = %s\n" % (SIDEBAR_TABLE, _append_token(DEFAULT_ROWS))
-        out = out.rstrip("\n") + "\n\n" + block
-        changed.append("rows (new table)")
-    for kind in kinds:
-        span = _find_value(out, OVERRIDE_TABLE, kind)
-        if not span:
-            continue
-        merged = _append_token(out[span[0] : span[1]])
-        if merged is None:
-            continue
-        out = out[: span[0]] + merged + out[span[1] :]
-        changed.append("rows_by_agent.%s" % kind)
-    return out, changed
-
-
-def sidebar_snippet():
-    return "%s\nrows = %s" % (SIDEBAR_TABLE, _append_token(DEFAULT_ROWS))
-
-
-def _rewrite_config(edit, kinds, done_word):
-    """Apply `edit` to config.toml, backing the original up first.
-
-    Returns (status, where, what changed). The edited text is parsed before it
-    replaces anything, so a bad edit is refused rather than written.
-    """
-    path = config_path()
-    if not os.path.exists(path):
-        return "missing", path, []
-    with open(path, encoding="utf-8") as handle:
-        text = handle.read()
-    out, info = edit(text, kinds)
-    if out is None:
-        return info, path, []
-    if not _valid_toml(out):
-        return "unparsed", path, []
-    os.makedirs(CONFIG_BACKUP_DIR, exist_ok=True)
-    backup = os.path.join(CONFIG_BACKUP_DIR, "config.toml.%d" % int(time.time()))
-    with open(backup, "w", encoding="utf-8") as handle:
-        handle.write(text)
-    tmp = "%s.account-switch-tmp" % path
-    with open(tmp, "w", encoding="utf-8") as handle:
-        handle.write(out)
-    os.replace(tmp, path)
-    herdr("server", "reload-config")
-    return done_word, backup, info
-
-
-def wire_sidebar(kinds):
-    """Merge $TOKEN into the sidebar rows, keeping a backup of the original."""
-    return _rewrite_config(_merged_config, kinds, "wired")
-
-
-def unwire_sidebar(kinds):
-    """Remove $TOKEN from the sidebar rows, keeping a backup of the original."""
-    return _rewrite_config(_stripped_config, kinds, "unwired")
-
-
-def warn_if_unwired():
-    """A token nothing references renders nothing, and herdr reports no error.
-
-    Startup says so once rather than editing config behind your back.
-    """
-    try:
-        if not BADGE or os.path.exists(NAG_MARKER):
-            return
-        path = config_path()
-        if not os.path.exists(path):
-            return
-        with open(path, encoding="utf-8") as handle:
-            if _token_wired(handle.read()):
-                return
-        herdr(
-            "notification", "show", "Account Hub: badge not visible",
-            "--body",
-            "No sidebar row names $%s. Run the enable-badge action to add it."
-            % TOKEN,
-            "--sound", "none",
-        )
-        os.makedirs(STATE_DIR, exist_ok=True)
-        with open(NAG_MARKER, "w", encoding="utf-8") as handle:
-            handle.write("")
-    except Exception:
-        pass
-
-
-def cmd_enable_badge(argv):
-    status, where, info = wire_sidebar(KIND_ORDER)
-    if status == "wired":
-        print("wired $%s into %s (%s)" % (TOKEN, config_path(), ", ".join(info)))
-        print("backup: %s" % where)
-        print("config reloaded")
-    elif status == "already":
-        print("$%s is already named in the sidebar rows — nothing to do." % TOKEN)
-    elif status == "missing":
-        print("no herdr config at %s\n\nadd:\n\n%s" % (where, sidebar_snippet()))
-        return 1
-    else:
-        print(
-            "could not edit %s safely — add $%s by hand:\n\n%s"
-            % (where, TOKEN, sidebar_snippet())
-        )
-        return 1
-    return 0
-
-
-def cmd_disable_badge(argv):
-    """Stop showing the pane badge: leave the rows, then clear what is stamped.
-
-    Removing the token from the rows is what hides it. Clearing the panes as
-    well means nothing is left behind for a later `$acct` row to resurrect.
-    """
-    status, where, info = unwire_sidebar(KIND_ORDER)
-    agents = live_agents() or {}
-    for pane_id in agents:
-        _clear_badge(pane_id)
-    if status == "unwired":
-        print("removed $%s from %s (%s)" % (TOKEN, config_path(), ", ".join(info)))
-        print("backup: %s" % where)
-        print("cleared the badge from %d pane(s); config reloaded" % len(agents))
-    elif status == "already":
-        print("$%s is not named in the sidebar rows — nothing to remove." % TOKEN)
-        print("cleared the badge from %d pane(s)" % len(agents))
-    elif status == "missing":
-        print("no herdr config at %s" % where)
-        return 1
-    else:
-        print(
-            "could not edit %s safely — remove \"$%s\" from the rows by hand"
-            % (where, TOKEN)
-        )
-        return 1
-    return 0
-
-
 # What each account-changing command was doing, for the message when it fails.
 # These run from a herdr action, where stderr goes nowhere a person will see, so
 # a refusal has to say so on screen the way a completed switch already does.
-# Nothing polled belongs here: `badge` runs once a second from the tab bar, and
-# a toast per tick would be worse than the silence it replaces.
-NOTIFY_FAILURE = {"next": "switch", "switch": "switch", "save": "save", "reauth": "reauth"}
+# Polling commands such as `list` do not send failure notifications.
+NOTIFY_FAILURE = {"next": "switch", "switch": "switch", "save": "save", "reauth": "reauth",
+                  "codex-login": "sign in"}
 
 DISPATCH = {
     "ui": cmd_ui,
-    "enable-badge": cmd_enable_badge,
-    "disable-badge": cmd_disable_badge,
     "open": cmd_open,
     "next": cmd_next,
     "switch": cmd_switch,
     "save": cmd_save,
     "reauth": cmd_reauth,
+    "codex-login": cmd_codex_login,
     "status": cmd_status,
-    "stamp": cmd_stamp,
-    "badge": cmd_badge,
-    "badge-refresh": cmd_badge_refresh,
     "list": cmd_list,
     "usage": cmd_usage,
-    "usage-ui": cmd_usage_ui,
-    "open-usage": cmd_open_usage,
 }
 
 
 def main():
-    # Any invocation repoints the stable symlink, not just the startup hook.
-    # An update moves this directory, and herdr does not re-run startup hooks
-    # on install, so the link would otherwise stay stale until the next herdr
-    # start — long enough for the badge reading through it to disappear.
-    refresh_stable_link()
     if len(sys.argv) < 2 or sys.argv[1] not in DISPATCH:
         print(f"usage: switcher.py {{{'|'.join(DISPATCH)}}} [args]", file=sys.stderr)
         return 2
