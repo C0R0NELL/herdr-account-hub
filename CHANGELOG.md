@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.3.3 - 2026-10-11
+
+### Fixed
+
+- Show recognized OpenAI error codes in Codex switch refusals and cached login
+  problems instead of grouped descriptions, preserving the existing sign-in
+  guidance and protection of the active account.
+- Fall back to the HTTP status when no recognized provider code is available,
+  without displaying raw error messages or response bodies.
+
+### Maintenance
+
+- Cover provider error codes, HTTP fallback, and cached refusal display with
+  isolated regression tests, and update the authentication troubleshooting notes.
+- Include the previously committed LICENSE copyright attribution to Yuri Gomes.
+
 ## 0.3.2 - 2026-10-10
 
 ### Maintenance

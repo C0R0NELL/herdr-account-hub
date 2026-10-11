@@ -2098,14 +2098,7 @@ def proven_payload(kind, profile):
     except urllib.error.HTTPError as exc:
         if exc.code == 401 or _refresh_refused(exc):
             if kind == "codex":
-                reason = {
-                    "refresh_token_reused": "saved refresh token already used",
-                    "refresh_token_invalidated": "saved login revoked",
-                    "token_invalidated": "saved login revoked",
-                    "token_revoked": "saved login revoked",
-                    "refresh_token_expired": "saved login expired",
-                    "invalid_grant": "saved login no longer accepted",
-                }.get(_auth_error_code(exc), "saved login not accepted")
+                reason = _auth_error_code(exc) or f"HTTP {exc.code}"
                 _record_login_problem(key, reason, _profile_by_id(kind, profile["id"])["payload"])
                 raise SwitchError(
                     f"Codex: {label}: {reason} — active account unchanged; "

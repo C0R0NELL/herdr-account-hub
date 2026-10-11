@@ -163,21 +163,47 @@ class CodexLogin(_LoginFixture):
         stamp = payload["auth"]["last_refresh"]
         self.assertIsNotNone(datetime.fromisoformat(stamp.replace("Z", "+00:00")).tzinfo)
 
-    def test_refusal_names_reauthentication_action_instead_of_another_duplicate_save(self):
+    def test_refusal_preserves_provider_code_and_reauthentication_guidance(self):
         import io
         import urllib.error
-        error = urllib.error.HTTPError("https://example.invalid", 401, "refused", {},
-                io.BytesIO(b'{"error":{"code":"refresh_token_invalidated","message":"sensitive detail"}}'))
-        self.S._post_json = lambda *a: (_ for _ in ()).throw(error)
         self.S.fetch_usage = lambda *a: (_ for _ in ()).throw(urllib.error.HTTPError(
             "https://example.invalid", 401, "refused", {}, io.BytesIO(b'{}')))
-        with self.assertRaises(self.S.SwitchError) as caught:
-            self.S.proven_payload("codex", self.profile)
-        message = str(caught.exception)
-        self.assertIn("revoked", message)
-        self.assertIn("press a", message)
-        self.assertNotIn("sensitive detail", message)
-        self.assertNotIn("save it", message)
+        codes = ("refresh_token_invalidated", "token_invalidated", "token_revoked",
+                 "refresh_token_reused", "refresh_token_expired", "invalid_grant",
+                 "invalid_token", "token_expired")
+        for code in codes:
+            with self.subTest(code=code):
+                body = json.dumps({"error": {"code": code, "message": "sensitive detail"}}).encode()
+                error = urllib.error.HTTPError("https://example.invalid", 401, "refused", {},
+                                               io.BytesIO(body))
+                with patch.object(self.S, "_post_json", side_effect=error):
+                    with self.assertRaises(self.S.SwitchError) as caught:
+                        self.S.proven_payload("codex", self.profile)
+                self.assertEqual(str(caught.exception),
+                    f"Codex: One: {code} — active account unchanged; "
+                    "press a to sign in to this registration again")
+                key = "codex:" + self.profile["id"]
+                self.assertEqual(self.S._usage_cache()[key]["login_problem"], code)
+                self.assertEqual(self.S.BACKENDS["codex"].read_live(), self.current)
+                self.assertEqual(self.S._selection()["codex"], self.profile["id"])
+
+    def test_refusal_without_known_provider_code_shows_http_status_without_raw_body(self):
+        import io
+        import urllib.error
+        bodies = (b'{}', b'not JSON',
+                  b'{"error":{"code":"sensitive-code","message":"sensitive detail"}}')
+        self.S.fetch_usage = lambda *a: (_ for _ in ()).throw(urllib.error.HTTPError(
+            "https://example.invalid", 401, "refused", {}, io.BytesIO(b'{}')))
+        for body in bodies:
+            with self.subTest(body=body):
+                error = urllib.error.HTTPError("https://example.invalid", 401, "refused", {},
+                                               io.BytesIO(body))
+                with patch.object(self.S, "_post_json", side_effect=error):
+                    with self.assertRaises(self.S.SwitchError) as caught:
+                        self.S.proven_payload("codex", self.profile)
+                self.assertEqual(str(caught.exception),
+                    "Codex: One: HTTP 401 — active account unchanged; "
+                    "press a to sign in to this registration again")
 
 
 @unittest.skipUnless(os.environ.get("ACCOUNT_HUB_TEST_REAL_CODEX") == "1",

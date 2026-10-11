@@ -767,7 +767,7 @@ class UsagePicker(unittest.TestCase):
         self.percent["fresh-live"] = 87
         row = self.S.usage_rows(["codex"], force=True)[0]
         self.assertEqual(row["windows"][0]["percent"], 87)
-        self.assertEqual(row["problem"], "saved login revoked")
+        self.assertEqual(row["problem"], "refresh_token_invalidated")
 
     def test_r_refreshes_the_entire_page_without_opening_rename(self):
         self.S.usage_rows(["codex"])

@@ -70,9 +70,12 @@ provider's error vocabulary:
 | HTTP 429 | Record the provider cooldown; do not classify the login as revoked |
 | Network failure or other unrecognized response | Do not infer revocation; retain the separate runtime checks |
 
-Known error codes provide bounded explanations; raw provider messages and
-credentials are never printed. A JWT expiry and an account's plan string cannot
-establish whether its grant remains usable, or why a provider rejected it.
+Codex refusals display the recognized provider error code verbatim, falling back
+to the HTTP status when no known code is present. The rest of the refusal and
+reauthentication guidance stays unchanged. The cached login problem keeps the
+same code; raw provider messages and credentials are never printed. A JWT expiry
+and an account's plan string cannot establish whether its grant remains usable,
+or why a provider rejected it.
 
 # What Didn't Work
 
