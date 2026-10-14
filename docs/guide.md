@@ -126,6 +126,13 @@ with `~`; an unavailable earned-reset count is shown as `-`. A refused saved
 login requires reauthentication even if a fresh live login can read usage for
 that same person.
 
+The column beside the Codex reset count shows the nearest available expiry as
+`YYYY/MM/DD HH:MM UTC`. It shows `-` for zero resets, unavailable counts, or
+missing/incomplete expiry details. Both columns keep their width so the account
+email stays aligned. Positive counts fetch expiry details during usage refresh
+unless the usage response already supplies them; detail failures preserve the
+usage/count and detail rate limits respect the provider's cooldown.
+
 Using a Codex reset offers the available credit with the nearest expiry, including
 its time, and chooses randomly among equal expiries. Confirmation consumes it
 without switching the live account. The plugin rereads usage and counts afterward.

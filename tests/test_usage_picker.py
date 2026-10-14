@@ -984,6 +984,50 @@ class UsagePicker(unittest.TestCase):
         self.assertIn("'u' add new | 't' use reset", help_text)
         self.assertEqual(posts, [])
 
+    def test_reset_date_has_fixed_column_and_email_does_not_shift_for_dashes(self):
+        self.reset_provider()
+        frames = self.picker([27], height=14)
+        first = next(line for line in frames[0]["lines"].values() if "Alpha" in line)
+        date = "2099/10/22 19:09 UTC"
+        self.assertIn(date, first)
+        self.assertNotIn("expires", first.lower())
+        date_col = first.index(date)
+        email_col = first.index("Alpha@example.invalid")
+        with patch.object(self.S, "_http_json", side_effect=TimeoutError):
+            failed = self.picker([27], height=14)
+        line = next(line for line in failed[0]["lines"].values() if "Alpha" in line)
+        self.assertEqual(line[self.S.RESETS_COL:self.S.RESETS_COL + self.S.RESETS_W],
+                         "-".center(self.S.RESETS_W))
+        self.assertEqual(line[date_col:date_col + len(date)], "-".center(len(date)))
+        self.assertEqual(line.index("Alpha@example.invalid"), email_col)
+
+    def test_reset_date_keeps_email_aligned_for_zero_and_unknown_expiry(self):
+        _, banks = self.reset_provider()
+        banks["Bravo"] = []
+        for credit in banks["Charlie"]:
+            credit["expires_at"] = None
+        frames = self.picker([27], height=14)
+        lines = [next(line for line in frames[0]["lines"].values() if name in line)
+                 for name in ("Alpha", "Bravo", "Charlie")]
+        date_col = lines[0].index("2099/10/22 19:09 UTC")
+        email_cols = [line.index(name + "@example.invalid")
+                      for name, line in zip(("Alpha", "Bravo", "Charlie"), lines)]
+        self.assertEqual(len(set(email_cols)), 1)
+        for line in lines[1:]:
+            self.assertEqual(line[date_col:date_col + 20], "-".center(20))
+
+    def test_r_refreshes_reset_dates_and_expanded_rows_keep_column_positions(self):
+        _, banks = self.reset_provider()
+        def update_expiry():
+            banks["Alpha"] = banks["Alpha"][:1]
+            return ord("r")
+        frames = self.picker([update_expiry, ord("d"), 27], height=30)
+        first = next(line for line in frames[0]["lines"].values() if "Alpha" in line)
+        last = next(line for line in frames[-1]["lines"].values() if "Alpha" in line)
+        date_col = first.index("2099/10/22 19:09 UTC")
+        self.assertEqual(last[date_col:date_col + 20], "2099/11/01 00:00 UTC")
+        self.assertEqual(last.index("Alpha@example.invalid"), first.index("Alpha@example.invalid"))
+
     def test_t_modal_shows_selected_account_expiry_and_enter_escape(self):
         posts, banks = self.reset_provider()
         frames = self.picker([258, ord("t"), 10, 27], height=14)

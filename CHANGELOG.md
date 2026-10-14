@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.4.0 - 2026-10-14
+
+### Added
+
+- Show the nearest available Codex reset expiry beside the reset count in
+  `YYYY/MM/DD HH:MM UTC` format, using the existing per-account usage refresh
+  and cache. Refresh the date after reset consumption and switch verification.
+- Fetch expiry details only for positive reset counts when complete details are
+  absent from the usage response. Respect detail-request cooldowns during manual
+  refresh and preserve usage/count readings when expiry details cannot be read.
+
+### Changed
+
+- Keep reset count, expiry, and account email columns aligned with matching
+  four-space gaps. Center unavailable `-` placeholders within their columns.
+- Show `-` for expiry when resets are unavailable or zero, or when expiry
+  details are missing, malformed, incomplete, undated, or already expired.
+
+### Maintenance
+
+- Share reset availability and expiry filtering between the picker and the
+  redemption confirmation, preserving the existing earliest-expiry selection.
+- Add isolated regressions for account-specific expiry caching, UTC formatting,
+  provider failures/cooldowns, post-reset refresh, and picker column alignment.
+- Update the usage guide and reset troubleshooting notes.
+
 ## 0.3.3 - 2026-10-11
 
 ### Fixed

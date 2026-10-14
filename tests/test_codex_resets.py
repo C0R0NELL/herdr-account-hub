@@ -97,6 +97,163 @@ class CodexResets(unittest.TestCase):
         self.assertEqual([r["reset_credits"]["available_count"] for r in cached], [3, 1])
         self.assertEqual(self.requests, [])
 
+    def test_usage_refresh_caches_nearest_expiry_for_each_account_without_redemption(self):
+        rows = self.S.usage_rows(["codex"])
+        self.assertEqual([self.S.reset_expiry("codex", row) for row in rows],
+                         ["2099/10/22 19:09 UTC", "2099/01/01 00:00 UTC"])
+        self.assertEqual(len(self.requests), 4, "one usage and one detail GET per account")
+        self.assertTrue(all(body is None for _, _, body in self.requests))
+        self.assertEqual(self.redeemed, {})
+        self.requests.clear()
+        cached = self.S.usage_rows(["codex"], refresh=False)
+        self.assertEqual([row["reset_credits"] for row in cached],
+                         [row["reset_credits"] for row in rows])
+        self.assertEqual([self.S.reset_expiry("codex", row) for row in cached],
+                         [self.S.reset_expiry("codex", row) for row in rows])
+        self.S.usage_rows(["codex"])
+        self.assertEqual(self.requests, [], "fresh and cache-only reads must not fetch details")
+
+    def test_expiry_refresh_uses_provider_count_without_inferring_from_detail_rows(self):
+        native = self.S._http_json
+        def capped_details(url, headers, body=None):
+            reply = native(url, headers, body)
+            if url == self.S.CODEX_RESETS_URL:
+                reply["credits"] = reply["credits"][:1]
+            return reply
+        with patch.object(self.S, "_http_json", side_effect=capped_details):
+            rows = self.S.usage_rows(["codex"])
+        self.assertEqual(rows[0]["reset_credits"]["available_count"], 3)
+        self.assertEqual(self.S.reset_expiry("codex", rows[0]), "-")
+
+    def test_zero_or_missing_count_skips_detail_requests(self):
+        self.banks["One"] = []
+        native = self.S._http_json
+        def missing_summary(url, headers, body=None):
+            reply = native(url, headers, body)
+            if url.endswith("/usage") and headers["Authorization"] == "Bearer Two":
+                reply.pop("rate_limit_reset_credits", None)
+            return reply
+        with patch.object(self.S, "_http_json", side_effect=missing_summary):
+            rows = self.S.usage_rows(["codex"])
+        self.assertEqual(self.S.reset_summary("codex", rows[0]), "0 reset")
+        self.assertEqual(self.S.reset_summary("codex", rows[1]), "-")
+        self.assertTrue(all(self.S.reset_expiry("codex", row) == "-" for row in rows))
+        self.assertTrue(all(url.endswith("/usage") for url, _, _ in self.requests))
+
+    def test_failed_details_keep_usage_and_count_but_clear_previous_expiry(self):
+        self.S.usage_rows(["codex"])
+        native = self.S._http_json
+        def unavailable_details(url, headers, body=None):
+            if url == self.S.CODEX_RESETS_URL:
+                raise TimeoutError("sensitive provider detail")
+            return native(url, headers, body)
+        with patch.object(self.S, "_http_json", side_effect=unavailable_details):
+            rows = self.S.usage_rows(["codex"], force=True)
+        self.assertEqual(rows[0]["windows"][0]["percent"], 100)
+        self.assertEqual(self.S.reset_summary("codex", rows[0]), "3 resets")
+        self.assertEqual(self.S.reset_expiry("codex", rows[0]), "-")
+        self.assertIsNone(rows[0]["problem"])
+
+    def test_refused_details_do_not_infer_revocation_or_renew_other_logins(self):
+        native = self.S._http_json
+        for status in (401, 403, 500):
+            def refused_details(url, headers, body=None):
+                if url == self.S.CODEX_RESETS_URL:
+                    raise urllib.error.HTTPError(url, status, "refused", {},
+                                                 io.BytesIO(b'{"message":"SECRET"}'))
+                return native(url, headers, body)
+            with self.subTest(status=status), \
+                    patch.object(self.S, "_http_json", side_effect=refused_details):
+                rows = self.S.usage_rows(["codex"], force=True)
+            self.assertEqual(self.S.reset_summary("codex", rows[0]), "3 resets")
+            self.assertEqual(self.S.reset_expiry("codex", rows[0]), "-")
+            self.assertTrue(all(row["problem"] is None for row in rows))
+
+    def test_malformed_missing_and_undated_details_show_no_date(self):
+        native = self.S._http_json
+        replies = (None, {}, {"available_count": 3, "credits": None},
+                   {"available_count": 1, "credits": [credit("bad", "not-a-date")]},
+                   {"available_count": 1, "credits": [credit("bad", True)]},
+                   {"available_count": 1, "credits": [credit("bad", float("inf"))]},
+                   {"available_count": 1, "credits": [credit("undated", None)]})
+        for reply in replies:
+            def details(url, headers, body=None):
+                return reply if url == self.S.CODEX_RESETS_URL else native(url, headers, body)
+            with self.subTest(reply=reply), patch.object(self.S, "_http_json", side_effect=details):
+                rows = self.S.usage_rows(["codex"], force=True)
+            self.assertEqual(self.S.reset_expiry("codex", rows[0]), "-")
+            self.assertIsNone(rows[0]["problem"])
+
+    def test_detail_rate_limit_is_cached_and_respected_by_forced_refresh(self):
+        native = self.S._http_json
+        details = []
+        clock = [time.time()]
+        def throttled_details(url, headers, body=None):
+            if url == self.S.CODEX_RESETS_URL and headers["Authorization"] == "Bearer One":
+                details.append(url)
+                raise urllib.error.HTTPError(url, 429, "slow down", {"Retry-After": "300"},
+                                             io.BytesIO(b'{}'))
+            return native(url, headers, body)
+        with patch.object(self.S.time, "time", side_effect=lambda: clock[0]), \
+                patch.object(self.S, "_http_json", side_effect=throttled_details):
+            self.S.usage_rows(["codex"])
+            clock[0] += 5
+            rows = self.S.usage_rows(["codex"], force=True)
+            self.assertEqual(len(details), 1)
+            self.assertEqual(self.S.reset_summary("codex", rows[0]), "3 resets")
+            self.assertEqual(self.S.reset_expiry("codex", rows[0]), "-")
+            clock[0] += 300
+            self.S.usage_rows(["codex"], force=True)
+            self.assertEqual(len(details), 2)
+
+    def test_expiry_filters_invalid_credits_and_compares_instants_in_utc(self):
+        self.banks["One"] = [credit("late-local", "2099-10-22T08:30:00-03:00"),
+                             credit("first", "2099-10-22T09:00:00.100000Z"),
+                             credit("expired", "2000-01-01T00:00:00Z"),
+                             credit("busy", "2090-01-01T00:00:00Z", "redeeming"),
+                             credit("other", "2090-01-01T00:00:00Z", reset_type="other"),
+                             credit("undated", None)]
+        row = self.S.usage_rows(["codex"])[0]
+        self.assertEqual(self.S.reset_expiry("codex", row), "2099/10/22 09:00 UTC")
+
+    def test_usage_details_can_supply_expiry_without_another_request(self):
+        native = self.S._http_json
+        def detailed_usage(url, headers, body=None):
+            reply = native(url, headers, body)
+            if url.endswith("/usage"):
+                who = headers["Authorization"].removeprefix("Bearer ")
+                reply["rate_limit_reset_credits"]["credits"] = copy.deepcopy(self.banks[who])
+            return reply
+        with patch.object(self.S, "_http_json", side_effect=detailed_usage):
+            rows = self.S.usage_rows(["codex"])
+        self.assertEqual(self.S.reset_expiry("codex", rows[0]), "2099/10/22 19:09 UTC")
+        self.assertEqual(len(self.requests), 2)
+
+    def test_consuming_reset_refreshes_date_to_next_available_credit(self):
+        self.S.usage_rows(["codex"])
+        self.S.consume_reset(self.prepare())
+        row = self.S.usage_rows(["codex"], refresh=False)[0]
+        self.assertEqual(self.S.reset_summary("codex", row), "2 resets")
+        self.assertEqual(self.S.reset_expiry("codex", row), "2099/11/01 00:00 UTC")
+
+    def test_switch_verification_keeps_expiry_when_it_updates_the_usage_cache(self):
+        profile = self.profiles[0]
+        self.S.proven_payload("codex", profile)
+        row = self.S.usage_rows(["codex"], refresh=False)[0]
+        self.assertEqual(self.S.reset_expiry("codex", row), "2099/10/22 19:09 UTC")
+        self.assertTrue(all(body is None for _, _, body in self.requests))
+
+    def test_consuming_last_reset_clears_expiry_without_an_extra_detail_get(self):
+        self.S.usage_rows(["codex"])
+        attempt = self.S.prepare_reset("codex", self.profiles[1]["id"])
+        self.requests.clear()
+        self.S.consume_reset(attempt)
+        row = self.S.usage_rows(["codex"], refresh=False)[1]
+        self.assertEqual(self.S.reset_summary("codex", row), "0 reset")
+        self.assertEqual(self.S.reset_expiry("codex", row), "-")
+        self.assertEqual([url for url, _, _ in self.requests],
+                         [self.S.CODEX_RESETS_URL + "/consume", self.S.CODEX_USAGE_URL])
+
     def test_prepare_chooses_earliest_and_only_reads_selected_account(self):
         attempt = self.prepare()
         self.assertEqual(attempt["credit"]["id"], "first")

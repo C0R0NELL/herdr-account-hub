@@ -1986,7 +1986,21 @@ def _reset_summary(body):
     count = body.get("available_count") if isinstance(body, dict) else None
     if type(count) is not int or count < 0:
         return None
-    return {"available_count": count}
+    summary = {"available_count": count}
+    if "next_expires_at" in body:
+        expiry = body["next_expires_at"]
+        summary["next_expires_at"] = (expiry if type(expiry) in (int, float)
+                                      and float('-inf') < expiry < float('inf') else None)
+    elif "credits" in body:
+        try:
+            available = _available_reset_credits(body, count)
+        except SwitchError:
+            pass  # Incomplete details cannot establish the nearest expiry.
+        else:
+            dated = [credit["expires_at"] for credit in available.values()
+                     if credit["expires_at"] is not None]
+            summary["next_expires_at"] = min(dated) if dated else None
+    return summary
 
 
 def _codex_usage_reading(body):
@@ -2093,6 +2107,8 @@ def proven_payload(kind, profile):
             payload = renewed
             windows = fetch_usage(kind, payload)
         if windows:
+            if kind == "codex":
+                _refresh_reset_details(profile, payload, windows)
             _remember_usage(key, windows)
             _clear_login_problem(key)
     except urllib.error.HTTPError as exc:
@@ -2128,6 +2144,11 @@ def _remember_usage(key, windows):
     now = time.time()
     if isinstance(windows, UsageWindows):
         entry.update(reset_credits=windows.reset_credits, reset_credits_at=now)
+        if hasattr(windows, "reset_details_retry_after"):
+            if windows.reset_details_retry_after:
+                entry["reset_details_retry_after"] = windows.reset_details_retry_after
+            else:
+                entry.pop("reset_details_retry_after", None)
     # Stamp each window with the moment it was read. A rate worked out from a
     # cached reading has to be measured against that moment, not against a clock
     # that has kept running since — see _spend_rate.
@@ -2314,6 +2335,8 @@ def _usage_rows(kinds=None, refresh=True, force=False):
                     windows = None
             if windows is not None:
                 state = "live"
+                if kind == "codex":
+                    _refresh_reset_details(profile, payload, windows)
                 _remember_usage(key, windows)
                 if not from_live or payload == profile.get("payload"):
                     _clear_login_problem(key)
@@ -2386,8 +2409,8 @@ def _advance_reset_usage_refresh(key):
     _write_json_secret(USAGE_CACHE, cache)
 
 
-def _reset_request(profile, url, body=None):
-    """Authenticated request for exactly this registration; no account fallback."""
+def _reset_payload(profile):
+    """Use the selected registration, or its matching live account for reads."""
     backend = BACKENDS["codex"]
     live = backend.read_live()
     sync_live_profile("codex", live)
@@ -2396,6 +2419,12 @@ def _reset_request(profile, url, body=None):
     from_live = bool(live and (identity.get("user_id") or identity.get("email"))
                      and _fingerprint(identity) == _fingerprint(backend.identity(live)))
     payload = live if from_live else profile["payload"]
+    return profile, payload, from_live
+
+
+def _reset_request(profile, url, body=None):
+    """Authenticated request for exactly this registration; no account fallback."""
+    profile, payload, from_live = _reset_payload(profile)
     key = "codex:" + profile["id"]
     try:
         if not from_live and USAGE_RENEW:
@@ -2434,6 +2463,71 @@ def _reset_request(profile, url, body=None):
         raise SwitchError("Reset service unreachable; press 't' to retry") from exc
 
 
+def _available_reset_credits(body, count):
+    """Complete, usable details shared by expiry display and reset selection."""
+    credits = body.get("credits")
+    if not isinstance(credits, list):
+        raise SwitchError("Reset expiry details unavailable; press 't' to retry")
+    ids = {credit.get("id") for credit in credits if isinstance(credit, dict)
+           and isinstance(credit.get("id"), str) and credit["id"]}
+    if len(ids) < count:
+        raise SwitchError("Reset details incomplete; cannot determine earliest expiry")
+    available = {}
+    for credit in credits:
+        if (not isinstance(credit, dict) or not isinstance(credit.get("id"), str)
+                or credit["id"] not in ids
+                or credit.get("reset_type") != "codex_rate_limits"
+                or credit.get("status") != "available"):
+            continue
+        raw_expiry = credit.get("expires_at")
+        expiry = _iso_epoch(raw_expiry)
+        if raw_expiry is not None and (type(raw_expiry) is bool or expiry is None
+                                      or not float('-inf') < expiry < float('inf')):
+            raise SwitchError("Reset expiry unavailable; press 't' to retry")
+        if expiry is not None and expiry <= time.time():
+            continue
+        available[credit["id"]] = {"id": credit["id"], "expires_at": expiry}
+    return available
+
+
+def _refresh_reset_details(profile, payload, reading):
+    """Enrich a successful usage read; detail failures leave usage/count intact.
+
+    Only positive counts need another GET. Reuse complete inline details when
+    present, and persist detail cooldowns in the existing per-registration cache.
+    This never renews tokens, consumes a credit, or changes the active login.
+    """
+    if not isinstance(reading, UsageWindows):
+        return
+    key = "codex:" + profile["id"]
+    retry_after = (_usage_cache().get(key) or {}).get("reset_details_retry_after")
+    reading.reset_details_retry_after = retry_after
+    summary = reading.reset_credits
+    if (not summary or not summary["available_count"] or "next_expires_at" in summary
+            or time.time() < (retry_after or 0)):
+        return
+    reading.reset_details_retry_after = None
+    token, account_id, _ = _codex_auth(payload)
+    if not token or not account_id:
+        return
+    try:
+        body = _http_json(CODEX_RESETS_URL, {
+            "Authorization": "Bearer " + token, "chatgpt-account-id": account_id,
+            "User-Agent": "codex-cli", "Accept": "application/json",
+        })
+    except urllib.error.HTTPError as exc:
+        if exc.code == 429:
+            reading.reset_details_retry_after = time.time() + _usage_retry_delay(exc)
+        return
+    except (OSError, ValueError):
+        return
+    # This newer response's count remains authoritative even when its list is
+    # capped or undated. Never infer a count from the number of detail rows.
+    detailed = _reset_summary(body)
+    if detailed is not None:
+        reading.reset_credits = detailed
+
+
 def _cache_resets(profile_id, summary, problem=None):
     cache = _usage_cache()
     entry = cache.setdefault("codex:" + profile_id, {})
@@ -2466,29 +2560,9 @@ def prepare_reset(kind, profile_id):
             raise SwitchError("Reset availability unknown; press 't' to retry")
         if not summary["available_count"]:
             raise SwitchError("No resets available for this account.")
-        credits = body.get("credits")
-        if not isinstance(credits, list):
-            raise SwitchError("Reset expiry details unavailable; press 't' to retry")
         # The provider may cap detail rows. Do not claim to choose the earliest
         # expiry when some credits have no returned details.
-        ids = {c.get("id") for c in credits if isinstance(c, dict)
-               and isinstance(c.get("id"), str) and c["id"]}
-        if len(ids) < summary["available_count"]:
-            raise SwitchError("Reset details incomplete; cannot determine earliest expiry")
-        available = {}
-        for credit in credits:
-            if (not isinstance(credit, dict) or not isinstance(credit.get("id"), str)
-                    or credit["id"] not in ids
-                    or credit.get("reset_type") != "codex_rate_limits"
-                    or credit.get("status") != "available"):
-                continue
-            raw_expiry = credit.get("expires_at")
-            expiry = _iso_epoch(raw_expiry)
-            if raw_expiry is not None and (expiry is None or not float('-inf') < expiry < float('inf')):
-                raise SwitchError("Reset expiry unavailable; press 't' to retry")
-            if expiry is not None and expiry <= time.time():
-                continue
-            available[credit["id"]] = {"id": credit["id"], "expires_at": expiry}
+        available = _available_reset_credits(body, summary["available_count"])
         if not available:
             raise SwitchError("No resets available for this account.")
         nearest = min(c["expires_at"] if c["expires_at"] is not None else float("inf")
@@ -2550,6 +2624,8 @@ def consume_reset(attempt):
                 _queue_reset_usage_refresh(key)
             _cache_resets(profile_id, None, "usage refresh required")
             reading = _codex_usage_reading(_reset_request(profile, CODEX_USAGE_URL))
+            latest, payload, _ = _reset_payload(profile)
+            _refresh_reset_details(latest, payload, reading)
             _remember_usage(key, reading)
         except Exception:
             if (_usage_cache().get(key) or {}).get("reset_usage_refresh"):
@@ -3070,12 +3146,14 @@ LABEL_W = 16
 USAGE_W = 20
 RESETS_W = 12
 RESETS_GAP = 4
+RESET_EXPIRY_W = 20  # YYYY/MM/DD HH:MM UTC
+RESET_EXPIRY_GAP = 4
 # Where the usage column starts: " " + mark + " " + label + " ".
 USAGE_COL = 3 + LABEL_W + 1
 RESETS_COL = USAGE_COL + USAGE_W + RESETS_GAP
 
 
-def _profile_line(kind, p, width, usage=None, problem=False, resets=None):
+def _profile_line(kind, p, width, usage=None, problem=False, resets=None, expiry=None):
     backend = BACKENDS[kind]
     mark = "!" if problem else ("●" if p.get("_active") else " ")
     leading = "●" if problem and p.get("_active") else " "
@@ -3084,7 +3162,15 @@ def _profile_line(kind, p, width, usage=None, problem=False, resets=None):
         desc = "saved " + p["_saved_hint"] + " | " + desc
     label = str(p["label"])[:LABEL_W]
     if resets is not None:
-        desc = "%-*s %s" % (RESETS_W, resets[:RESETS_W], desc)
+        if expiry is None:
+            expiry = "-" if kind == "codex" else ""
+        if resets == "-":
+            resets = resets.center(RESETS_W)
+        if expiry == "-":
+            expiry = expiry.center(RESET_EXPIRY_W)
+        gap = " " * RESET_EXPIRY_GAP
+        desc = "%-*s%s%-*s%s%s" % (RESETS_W, resets[:RESETS_W], gap,
+                                   RESET_EXPIRY_W, expiry[:RESET_EXPIRY_W], gap, desc)
     if usage is None:
         line = "%s%s %-*s %s" % (leading, mark, LABEL_W, label, desc)
     else:
@@ -3104,6 +3190,22 @@ def reset_summary(kind, row):
     count = summary["available_count"]
     unit = "reset" if count <= 1 else "resets"
     return f"{'~' if old else ''}{count} {unit}"
+
+
+def reset_expiry(kind, row):
+    """Nearest available credit's expiry, with fixed-width UI placeholders."""
+    if kind != "codex":
+        return ""
+    summary = _reset_summary((row or {}).get("reset_credits"))
+    if not summary or not summary["available_count"] or (row or {}).get("problem"):
+        return "-"
+    expiry = summary.get("next_expires_at")
+    if expiry is None or expiry <= time.time():
+        return "-"
+    try:
+        return datetime.fromtimestamp(expiry, timezone.utc).strftime("%Y/%m/%d %H:%M UTC")
+    except (OSError, OverflowError, ValueError):
+        return "-"
 
 
 def _picker_help(width):
@@ -3711,7 +3813,7 @@ def cmd_ui(argv):
                     problem = bool(row and row.get("problem"))
                     resets = reset_summary(kind, row)
                     line = _profile_line(kind, body, w, text, problem=problem,
-                                         resets=resets).ljust(w - 1)
+                                         resets=resets, expiry=reset_expiry(kind, row)).ljust(w - 1)
                     account_lines[start] = ((kind, body["id"]), resets)
                     lines.append((line, curses.A_REVERSE if is_sel else curses.A_NORMAL,
                                   (text, sev) if text and not is_sel else None, problem))

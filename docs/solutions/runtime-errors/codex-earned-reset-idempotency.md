@@ -38,13 +38,21 @@ that hint or claim it proves rejection.
 
 # Implementation rules
 
-- Poll counts with existing usage reads/cache; detail reads occur only on **t**.
-  Count is authoritative, not the length of a potentially capped detail list.
+- Poll counts and nearest expiry with existing usage reads/cache. Positive counts
+  need at most one additional detail GET per account refresh unless the usage
+  response already supplies complete details. **t** rereads details before
+  confirmation. Count is authoritative, not the length of a potentially capped
+  detail list. Detail read failures preserve usage/count and show `-` for expiry;
+  detail HTTP 429 cooldowns persist per UUID and also apply to forced refresh.
 - Scope credentials, cache and operation journal to the selected registration
   UUID. Never change global auth, selection, history or the running daemon.
 - Choose available Codex credits with the closest future expiry; randomize
   ties. Exclude expired/redeeming/unknown types. Treat undated credits after
   dated credits and show `Expires: not provided` when necessary.
+- The picker shows the nearest dated expiry as `YYYY/MM/DD HH:MM UTC` in a fixed
+  column beside the count. Zero/unknown resets and incomplete, malformed or
+  undated detail lists show `-` there without shifting the account's email.
+  Display and confirmation use the same availability/expiry filtering rules.
 - Fail without consuming if complete expiry details cannot be determined.
 - Preparing/canceling performs no redemption. Persist the operation UUID to
   `reset-attempts.json` in the durable plugin state directory (0600, inside
