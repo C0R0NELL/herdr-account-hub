@@ -3147,7 +3147,8 @@ USAGE_W = 20
 RESETS_W = 12
 RESETS_GAP = 4
 RESET_EXPIRY_W = 20  # YYYY/MM/DD HH:MM UTC
-RESET_EXPIRY_GAP = 4
+RESET_EXPIRY_GAP = 2
+ACCOUNT_INFO_GAP = 10
 # Where the usage column starts: " " + mark + " " + label + " ".
 USAGE_COL = 3 + LABEL_W + 1
 RESETS_COL = USAGE_COL + USAGE_W + RESETS_GAP
@@ -3168,9 +3169,9 @@ def _profile_line(kind, p, width, usage=None, problem=False, resets=None, expiry
             resets = resets.center(RESETS_W)
         if expiry == "-":
             expiry = expiry.center(RESET_EXPIRY_W)
-        gap = " " * RESET_EXPIRY_GAP
-        desc = "%-*s%s%-*s%s%s" % (RESETS_W, resets[:RESETS_W], gap,
-                                   RESET_EXPIRY_W, expiry[:RESET_EXPIRY_W], gap, desc)
+        desc = "%-*s%s%-*s%s%s" % (RESETS_W, resets[:RESETS_W], " " * RESET_EXPIRY_GAP,
+                                  RESET_EXPIRY_W, expiry[:RESET_EXPIRY_W],
+                                  " " * ACCOUNT_INFO_GAP, desc)
     if usage is None:
         line = "%s%s %-*s %s" % (leading, mark, LABEL_W, label, desc)
     else:

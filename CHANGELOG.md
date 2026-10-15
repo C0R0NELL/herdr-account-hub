@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.1 - 2026-10-15
+
+### Fixed
+
+- Bring reset expiry dates closer to their counts and increase spacing before
+  account details, preserving fixed columns and centered unavailable markers.
+
 ## 0.4.0 - 2026-10-14
 
 ### Added
