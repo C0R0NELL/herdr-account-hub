@@ -42,6 +42,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import textwrap
 import threading
 import urllib.error
 import urllib.request
@@ -183,6 +184,27 @@ class SwitchError(Exception):
 
 class LockBusy(SwitchError):
     """Another process owns the account store; no protected operation started."""
+
+
+class TemporaryChatsError(SwitchError):
+    """All in-memory chats that prevent a lossless daemon restart."""
+
+    def __init__(self, threads):
+        def short(value, limit):
+            text = " ".join("".join(char if char.isprintable() else " "
+                                    for char in str(value)).split())
+            return text if len(text) <= limit else text[:limit - 1] + "…"
+        self.entries = []
+        self.thread_ids = tuple(sorted(thread["id"] for thread in threads))
+        for number, thread in enumerate(sorted(threads, key=lambda item: item["id"]), start=1):
+            name = short(thread.get("name") or "Untitled", 24) or "Untitled"
+            directory = short(os.path.basename(os.path.normpath(thread["cwd"])), 20) or "/"
+            # Use metadata only; conversation previews can contain private text.
+            self.entries.append(f"[{number}] {directory}: {name} ({thread['id'][:8]})")
+        self.summary = "%d temporary Codex chat%s; account unchanged" % (
+            len(self.entries), "" if len(self.entries) == 1 else "s")
+        self.guidance = "Close these chats and retry; account unchanged"
+        super().__init__("\n".join([self.summary, *self.entries, self.guidance]))
 
 
 # ---- running a command ----------------------------------------------------
@@ -758,8 +780,8 @@ class CodexBackend(Backend):
             raise SwitchError("profile holds no codex credentials")
         _write_json_secret(self.auth, auth)
 
-    def prepare_switch(self):
-        return CodexMachine(self)
+    def prepare_switch(self, discard_temporary=()):
+        return CodexMachine(self, discard_temporary=discard_temporary)
 
     def identity(self, payload):
         auth = payload.get("auth") or {}
@@ -1063,7 +1085,7 @@ def _backup(kind, payload):
 
 # ---- the switch itself ----------------------------------------------------
 
-def switch(kind, key):
+def switch(kind, key, *, discard_temporary=()):
     """Apply a saved account; Codex uses one account for this machine's home."""
     backend = BACKENDS[kind]
     with _Lock():
@@ -1072,7 +1094,7 @@ def switch(kind, key):
             raise SwitchError(f"no {kind} profile named {key!r}")
         live = backend.read_live()
         outgoing = _selected_login_profile(kind, live) if live is not None else None
-        runtime = backend.prepare_switch() if kind == "codex" else None
+        runtime = backend.prepare_switch(discard_temporary=discard_temporary) if kind == "codex" else None
         if outgoing is not None and outgoing["id"] == target["id"] and runtime is None:
             sync_live_profile(kind, live)
             return f"{kind}: already on {target['label']}"
@@ -1082,6 +1104,8 @@ def switch(kind, key):
             sync_live_profile(kind, live)
             target = _profile_by_id(kind, target["id"])
         target["payload"] = proven_payload(kind, target)
+        if runtime:
+            runtime.recheck()
 
         if live is not None:
             if outgoing is None and not _live_account_saved(kind, live):
@@ -1122,6 +1146,7 @@ def switch(kind, key):
                 runtime.record(target)
             _select_profile(kind, target["id"])
         except (SwitchError, OSError) as exc:
+            loss = "; temporary chats may already be closed" if runtime and runtime.discard_attempted else ""
             try:
                 if previous is not None:
                     backend.write_live(previous)
@@ -1132,8 +1157,10 @@ def switch(kind, key):
                         raise SwitchError("previous account was signed out")
                     runtime.apply(previous)
             except (SwitchError, OSError):
-                raise SwitchError("Account change failed; previous login reload could not be confirmed. Check Codex before retrying.") from exc
-            raise SwitchError(str(exc) + "; previous login restored") from exc
+                raise SwitchError("Account change failed; previous login reload could not be confirmed. Check Codex before retrying." + loss) from exc
+            if isinstance(exc, TemporaryChatsError) and runtime and not runtime.restarted:
+                raise
+            raise SwitchError(str(exc) + "; previous login restored" + loss) from exc
 
     ident = backend.describe(target.get("identity") or {})
     if kind == "codex":
@@ -1197,11 +1224,16 @@ class CodexMachine:
     lived switch transaction, not another Codex launcher or authentication host.
     """
 
-    def __init__(self, backend):
+    def __init__(self, backend, discard_temporary=()):
         self.backend = backend
         self.environment = _codex_environment()
         self.info = None
         self.threads = {}
+        self.temporary = {}
+        self.discard_temporary = frozenset(discard_temporary)
+        if any(not _valid_uuid(value) for value in self.discard_temporary):
+            raise SwitchError("Temporary chat confirmation is invalid; account unchanged")
+        self.discard_attempted = False
         self.restarted = False
         _check_codex_compatibility()
         result = _run([CODEX, "app-server", "daemon", "version"], env=self.environment)
@@ -1229,11 +1261,26 @@ class CodexMachine:
         try:
             config = rpc.call("config/read", {"includeLayers": False}).get("config") or {}
             self._check_config(config)
-            for thread_id in self._loaded(rpc):
-                thread = self._thread(rpc, thread_id)
-                if thread.get("ephemeral"):
-                    raise SwitchError("An open chat is temporary and cannot be safely reloaded")
-                self.threads[thread_id] = thread
+            self._inspect_threads(rpc)
+        finally:
+            rpc.close()
+
+    def _inspect_threads(self, rpc):
+        persistent, temporary = {}, {}
+        for thread_id in sorted(self._loaded(rpc)):
+            thread = self._thread(rpc, thread_id)
+            (temporary if thread.get("ephemeral") else persistent)[thread_id] = thread
+        if not set(temporary).issubset(self.discard_temporary):
+            raise TemporaryChatsError(list(temporary.values()))
+        self.threads, self.temporary = persistent, temporary
+
+    def recheck(self):
+        """Revalidate the exact discard consent and refresh saved-chat metadata."""
+        if self.info is None:
+            return
+        rpc = self._connect(self.info)
+        try:
+            self._inspect_threads(rpc)
         finally:
             rpc.close()
 
@@ -1301,7 +1348,10 @@ class CodexMachine:
     def apply(self, payload):
         if self.info is None:
             return "new chats will use this account"
+        if not self.restarted:
+            self.recheck()
         self.restarted = True
+        self.discard_attempted = self.discard_attempted or bool(self.temporary)
         grace = _codex_shutdown_grace_seconds(self.backend.home)
         result = _run([CODEX, "app-server", "daemon", "restart"],
                       env=self.environment, timeout=grace + 90)
@@ -1325,7 +1375,10 @@ class CodexMachine:
                 raise SwitchError("The restarted Codex did not adopt the selected account")
             deadline = time.monotonic() + CODEX_RECONNECT_TIMEOUT_S
             while True:
-                if set(self.threads).issubset(self._loaded(rpc)):
+                loaded = self._loaded(rpc)
+                if set(self.temporary) & loaded:
+                    raise SwitchError("Temporary chats did not close; account change not confirmed")
+                if set(self.threads).issubset(loaded):
                     break
                 if time.monotonic() >= deadline:
                     raise SwitchError("Some chats have not reconnected; account change not confirmed")
@@ -1340,7 +1393,10 @@ class CodexMachine:
             self.info = info
         finally:
             rpc.close()
-        return "%d chats reloaded" % len(self.threads)
+        result = "%d chats reloaded" % len(self.threads)
+        if self.temporary:
+            result += "; %d temporary chat%s closed" % (len(self.temporary), "" if len(self.temporary) == 1 else "s")
+        return result
 
     def record(self, profile):
         info = self.info
@@ -3560,18 +3616,18 @@ def _mouse_click(win):
     return (x, y) if 0 <= x < width and 0 <= y < height else None
 
 
-def _modal_hint(win, row, inner, hint="enter | esc"):
+def _modal_hint(win, row, inner, hint="enter | esc", actions=None):
     """Underline clickable actions while retaining their keyboard labels."""
     import curses
     win.addnstr(row, 2, hint, inner, curses.A_DIM)
-    for text in ("enter", "esc"):
+    for text, _ in actions or (("enter", 10), ("esc", 27)):
         start = hint.index(text)
         count = min(len(text), inner - start)
         if count > 0:
             win.addnstr(row, 2 + start, text, count, curses.A_UNDERLINE | curses.A_BOLD)
 
 
-def _modal_input(win, hint_row, hint="enter | esc"):
+def _modal_input(win, hint_row, hint="enter | esc", actions=None):
     """Route visible button clicks through the existing Enter/Esc handling."""
     import curses
     ch = win.getch()
@@ -3580,7 +3636,7 @@ def _modal_input(win, hint_row, hint="enter | esc"):
     click = _mouse_click(win)
     if click and click[1] == hint_row:
         inner = win.getmaxyx()[1] - 4
-        for text, key in (("enter", 10), ("esc", 27)):
+        for text, key in actions or (("enter", 10), ("esc", 27)):
             start = hint.index(text)
             if 2 + start <= click[0] < 2 + min(start + len(text), inner):
                 return key, click
@@ -3685,6 +3741,60 @@ def _choose(stdscr, title, options):
                 selected = min(selected + 1, len(options) - 1)
             elif ch in (curses.KEY_UP, ord("k")):
                 selected = max(selected - 1, 0)
+    finally:
+        _restore_picker(stdscr)
+
+
+def _temporary_chats_notice(stdscr, error):
+    """Confirm explicit discard of the listed chats; Esc makes no change."""
+    import curses
+
+    hint = "force (f) | esc"
+    actions = (("force", ord("f")), ("esc", 27))
+    scroll = 0
+    try:
+        while True:
+            _sync_picker_size(stdscr)
+            height, width = stdscr.getmaxyx()
+            if height < 10 or width < 24:
+                _picker_footer(stdscr, error.summary)
+                return False
+            width = min(width - 2, max(60, *(len(entry) + 4 for entry in error.entries)))
+            inner = width - 4
+            warning = [line for sentence in ("Force closes these chats and switches account.",
+                                             "Unsaved content will be lost.")
+                       for line in textwrap.wrap(sentence, inner)]
+            start = 2 + len(warning) + 1
+            lines = []
+            for entry in error.entries:
+                lines.extend(textwrap.wrap(entry, inner, subsequent_indent="    ") or [""])
+            rows = min(height - 2, start + len(lines) + 3)
+            available = rows - start - 2
+            if available < 1:
+                return False
+            scroll = min(scroll, max(0, len(lines) - available))
+            win = _center_win(stdscr, rows, width)
+            win.erase()
+            win.box()
+            title = " Temporary Codex chats"
+            if len(lines) > available:
+                title += " | ↑/↓ scroll"
+            win.addnstr(0, 2, title + " ", inner, curses.A_BOLD)
+            for index, line in enumerate(warning, start=2):
+                win.addnstr(index, 2, line, inner, curses.A_BOLD)
+            for index, line in enumerate(lines[scroll:scroll + available], start=start):
+                win.addnstr(index, 2, line, inner)
+            _modal_hint(win, rows - 2, inner, hint, actions=actions)
+            win.refresh()
+            ch, _ = _modal_input(win, rows - 2, hint, actions=actions)
+            if ch == ord("f"):
+                return True
+            if ch == 27:
+                return False
+            if ch in (curses.KEY_DOWN, ord("j")):
+                scroll = min(scroll + 1, max(0, len(lines) - available))
+            elif ch in (curses.KEY_UP, ord("k")):
+                scroll = max(0, scroll - 1)
     finally:
         _restore_picker(stdscr)
 
@@ -3930,6 +4040,21 @@ def cmd_ui(argv):
                                           line.ljust(w - 1), w - 1, curses.A_BOLD)
                         _picker_footer(stdscr, progress_lines[-1])
                     message = switch(selected[1], profile["id"])
+                except TemporaryChatsError as exc:
+                    message = exc.summary
+                    blocked = exc
+                    while _temporary_chats_notice(stdscr, blocked):
+                        try:
+                            _picker_footer(stdscr, "Switching Codex account... (Daemon may wait for active work)")
+                            message = switch(selected[1], profile["id"],
+                                             discard_temporary=blocked.thread_ids)
+                            break
+                        except TemporaryChatsError as changed:
+                            blocked = changed
+                            message = changed.summary
+                        except SwitchError as failed:
+                            message = str(failed)
+                            break
                 except SwitchError as exc:
                     message = str(exc)
                 finally:

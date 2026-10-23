@@ -99,6 +99,31 @@ curses.wrapper(run)
         self.assertTrue(all(1 <= int(y) <= 14 and 1 <= int(x) <= 80
                             for y, x in positions), positions)
 
+    def test_native_temporary_chat_list_scrolls_and_dismisses_with_escape(self):
+        result, _ = self.terminal('''
+error = S.TemporaryChatsError([
+    {'id': f'{number:08d}-0000-4000-8000-000000000001',
+     'name': f'Draft {number}', 'cwd': '/work/project'} for number in range(1, 21)])
+native_input = S._modal_input
+def read(win, hint_row, hint='enter | esc', **kwargs):
+    result.setdefault('frames', []).append([
+        win.instr(row, 0).decode() for row in range(win.getmaxyx()[0])])
+    return native_input(win, hint_row, hint, **kwargs)
+S._modal_input = read
+def run(screen):
+    curses.curs_set(0)
+    resize(12, 80)
+    result['confirmed'] = S._temporary_chats_notice(screen, error)
+    result['returned'] = True
+curses.wrapper(run)
+''', keys=[(b'Temporary Codex chats', b'j' * 30 + b'\x1b')])
+        self.assertTrue(result["returned"])
+        self.assertFalse(result["confirmed"])
+        text = " ".join(line for frame in result["frames"] for line in frame)
+        self.assertIn("[1] project: Draft 1", text)
+        self.assertIn("[20] project: Draft 20", text)
+        self.assertIn("Unsaved content will be lost.", text)
+
     def test_picker_rebuilds_at_current_size_after_switching(self):
         result, wire = self.terminal('''
 native_wrapper = curses.wrapper

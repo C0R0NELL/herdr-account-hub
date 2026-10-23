@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.5.0 - 2026-10-23
+
+### Added
+
+- Identify every temporary Codex chat blocking an account switch in a numbered,
+  scrollable dialog with its directory, title, and short chat reference.
+- Offer Force by keyboard (`f`) or mouse to discard the listed temporary chats
+  during the normal daemon restart and continue switching accounts. Keep the
+  unsaved-content warning visible; Escape cancels and Enter does not force.
+
+### Fixed
+
+- Recheck temporary chats after credential verification and immediately before
+  restarting. Require new confirmation when another temporary chat appears,
+  and preserve a confirmed chat if it has become persistent.
+- Retain saved-chat ID, title, directory, and account verification during forced
+  switches. Report possible temporary-chat loss even when account rollback fails.
+
+### Maintenance
+
+- Add isolated regressions for numbered diagnostics, scrolling, keyboard/mouse
+  confirmation, concurrent chat changes, and failed-switch recovery.
+- Extend the optional native Codex test to verify temporary-chat discard while
+  two saved chats reconnect with unchanged IDs, titles, and working directories.
+- Document the Force workflow, investigation evidence, and daemon API limits.
+
 ## 0.4.1 - 2026-10-15
 
 ### Fixed

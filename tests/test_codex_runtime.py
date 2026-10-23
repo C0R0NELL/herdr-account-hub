@@ -207,14 +207,31 @@ class RealCodexMachine(_RuntimeFixture):
                     self.assertIsNone(client.poll())
                     self.assertIn(b"OpenAI Codex", output)
                 rpc.close(); rpc = None
-                for profile in self.profiles[1:]:
-                    message = S.switch("codex", profile["id"])
+                for index, profile in enumerate(self.profiles[1:]):
+                    temporary_id = None
+                    confirmed = ()
+                    if index == 1:
+                        info = daemon("version")
+                        rpc = S.CodexRPC(info["socketPath"], S._codex_environment())
+                        temporary = rpc.call("thread/start", {
+                            "cwd": self.temp.name, "sandbox": "read-only", "ephemeral": True})["thread"]
+                        self.assertTrue(temporary["ephemeral"])
+                        temporary_id = temporary["id"]
+                        rpc.close(); rpc = None
+                        with self.assertRaises(S.TemporaryChatsError) as blocked:
+                            S.switch("codex", profile["id"])
+                        confirmed = blocked.exception.thread_ids
+                        self.assertIn(temporary_id, confirmed)
+                    message = S.switch("codex", profile["id"], discard_temporary=confirmed)
                     self.assertIn("2 chats reloaded", message)
                     info = daemon("version")
                     rpc = S.CodexRPC(info["socketPath"], S._codex_environment())
                     self.assertEqual(rpc.call("account/read", {"refreshToken": False})["account"]["email"],
                                      profile["identity"]["email"])
                     loaded = S.CodexMachine._loaded(rpc)
+                    if temporary_id:
+                        self.assertNotIn(temporary_id, loaded)
+                        self.assertIn("1 temporary chat closed", message)
                     self.assertTrue({t["id"] for t in before}.issubset(loaded))
                     for prior in before:
                         after = rpc.call("thread/read", {"threadId": prior["id"]})["thread"]

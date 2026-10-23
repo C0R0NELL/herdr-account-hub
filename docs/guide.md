@@ -96,6 +96,17 @@ that exceeds the daemon's shutdown deadline may be interrupted. Account Hub read
 those settings without changing them. A failed switch attempts rollback and
 reports when restoring the previous account cannot be confirmed.
 
+Loaded temporary Codex chats pause switching because they have no persisted
+history to resume after restarting the daemon. The picker lists every blocker
+as `[1]`, `[2]`, etc., with its directory, title (or `Untitled`) and a short chat
+reference. Scroll with the arrow keys. **Force** (click or `f`) discards those
+temporary chats during the normal Codex daemon restart and continues the account
+change; their unsaved content is lost. **Esc** cancels, and Enter does not force.
+The discard confirmation is checked again before changing credentials and
+before restarting; new temporary chats require another confirmation. Saved
+chats retain the normal identity/history/reconnection checks. This restarts the
+shared Codex daemon; it does not close Herdr panes or delete saved conversations.
+
 Implementation evidence and limitations are recorded in the
 [reload investigation](solutions/runtime-errors/codex-machine-account-reload.md).
 

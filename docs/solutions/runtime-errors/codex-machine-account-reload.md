@@ -85,3 +85,54 @@ Unix WebSocket transport remains experimental as described in the official docs.
   optional native integration with two chats and three dummy users, no inference.
 - The default suite does not restart a real daemon or read saved user accounts.
   The optional native test uses temporary homes and fictitious credentials.
+
+# Identifying a temporary chat (2026-10-23)
+
+A read-only inspection of a running 0.164.0 daemon returned an idle thread with
+`ephemeral: true`, no `name`, no preview and no storage `path`. Its originator was
+`codex-tui`. The official [app-server thread documentation](https://learn.chatgpt.com/docs/app-server#threads)
+distinguishes in-memory ephemeral threads from persisted history and establishes
+that `thread/loaded/list` includes loaded threads, not just resumable chats.
+These fields do not prove that an idle thread can safely be discarded or why its
+client created it. Do not infer a cache failure from the refusal.
+
+The previous refusal named no thread and stopped at the first blocker. It now
+collects every temporary thread in stable ID order and numbers them `[1]`, `[2]`,
+etc. Each entry identifies the directory basename, title (or `Untitled`) and a
+short thread ID. Labels are bounded and stripped of terminal control characters;
+conversation previews are never used. The picker displays a scrollable list;
+CLI errors include the numbered list and recovery guidance. Without explicit
+discard consent, ephemeral threads prevent credential writes and daemon restart.
+
+## Explicit Force confirmation
+
+The list offers **Force** (`f` or click) and **Esc**, with a persistent warning
+that unsaved content will be lost. Enter does not confirm destructive discard.
+The UI retries the same account/UUID with only the full temporary thread IDs
+shown in that dialog. Inspection after credential verification and immediately
+before restart checks that every currently temporary thread is in the confirmed
+set; otherwise it refuses and requests a new confirmation. A thread that became
+persistent joins the saved-chat snapshot instead of being discarded.
+
+Official docs and the installed 0.163.0 generated protocol schema establish no
+immediate close method for ephemeral roots. `thread/delete` cannot delete them;
+`thread/unsubscribe` only affects the calling connection and has an inactivity
+grace. Force therefore uses the existing official shared-daemon restart, whose
+process exit discards in-memory temporary chats. It does not send delete/archive
+requests, close Herdr panes, or kill unrelated processes. The restarted daemon
+must no longer list the confirmed temporary IDs, and saved chats still have
+their IDs, names, directories and adopted account verified. Failed switches
+attempt normal account rollback; already discarded temporary content cannot be
+reconstructed, and failures after a discard attempt say so.
+
+There is no API transaction that freezes other clients while restarting. The
+rechecks reduce stale consent; they cannot make concurrent thread creation
+atomic with the daemon command. Do not promise isolated per-thread shutdown or
+claim that normal rollback can restore ephemeral history.
+
+Fictitious regressions cover named/unnamed/idle ephemeral threads, unchanged
+authentication on cancel, multiple blockers, new-thread reconfirmation,
+preserved saved chats, sanitized labels, short terminals, scrolling, mouse/`f`
+confirmation and ignored Enter. The optional native runtime test also creates
+an ephemeral thread with fictitious credentials before a forced account switch
+and verifies its disappearance while the two saved native chats reconnect.

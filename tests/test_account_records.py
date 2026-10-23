@@ -46,7 +46,7 @@ class AccountRecords(unittest.TestCase):
             def present(self):
                 return True
 
-            def prepare_switch(self):
+            def prepare_switch(self, discard_temporary=()):
                 return None  # This fixture models credentials, never a real daemon.
 
             def read_live(self):

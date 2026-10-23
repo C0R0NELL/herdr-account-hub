@@ -92,6 +92,8 @@ class MachineSwitch(unittest.TestCase):
                     return subprocess.CompletedProcess(argv, 1, "", "secret provider detail")
                 self.pid += 1
                 self.running = True
+                self.threads = {key: thread for key, thread in self.threads.items()
+                                if not thread.get("ephemeral")}
                 self.server_payload = S.BACKENDS["codex"].read_live()
                 if self.wrong_account and self.restarts == 1:
                     self.server_payload = copy.deepcopy(self.profiles[0]["payload"])
@@ -129,6 +131,183 @@ class MachineSwitch(unittest.TestCase):
         self.S.switch("codex", self.profiles[2]["id"])
         self.assertEqual(self.restarts, 0)
         self.assertEqual(self.S.BACKENDS["codex"].read_live(), self.profiles[2]["payload"])
+
+    def test_temporary_chat_refusal_identifies_title_directory_and_id_before_writes(self):
+        thread_id = next(iter(self.threads))
+        thread = self.threads[thread_id]
+        thread.update(ephemeral=True, name="Draft deployment", cwd="/work/setupvibe",
+                      preview="PRIVATE PROMPT MUST NOT BE SHOWN")
+        before = self.S.BACKENDS["codex"].read_live()
+        with self.assertRaises(self.S.SwitchError) as caught:
+            self.S.switch("codex", self.profiles[1]["id"])
+        message = str(caught.exception)
+        self.assertIn("[1] setupvibe: Draft deployment", message)
+        self.assertIn(thread_id[:8], message)
+        self.assertIn("Close these chats and retry; account unchanged", message)
+        self.assertNotIn("PRIVATE PROMPT", message)
+        self.assertEqual(self.S.BACKENDS["codex"].read_live(), before)
+        self.assertEqual(self.S._selection()["codex"], self.profiles[0]["id"])
+        self.assertEqual(self.restarts, 0)
+        self.assertTrue(self.closed, "the diagnostic connection must close on refusal")
+
+    def test_untitled_temporary_chat_remains_identifiable_without_using_preview(self):
+        thread_id = next(iter(self.threads))
+        self.threads[thread_id].update(ephemeral=True, name=None, cwd="/work/setupvibe",
+                                       preview="SECRET PROMPT")
+        with self.assertRaises(self.S.SwitchError) as caught:
+            self.S.switch("codex", self.profiles[1]["id"])
+        self.assertIn(f"[1] setupvibe: Untitled ({thread_id[:8]})", str(caught.exception))
+        self.assertEqual(self.restarts, 0)
+
+    def test_temporary_chat_identifier_is_bounded_and_has_no_terminal_controls(self):
+        thread_id = next(iter(self.threads))
+        self.threads[thread_id].update(ephemeral=True, name="\x1b[31mDraft\n" + "x" * 200,
+                                       cwd="/work/\x1b[31mproject\n" + "y" * 200)
+        with self.assertRaises(self.S.SwitchError) as caught:
+            self.S.switch("codex", self.profiles[1]["id"])
+        message = str(caught.exception)
+        self.assertNotIn("\x1b", message)
+        self.assertLessEqual(message.count("\n"), 2, "labels must not inject extra lines")
+        self.assertLessEqual(len(message), 180)
+        self.assertIn(thread_id[:8], message)
+
+    def test_ephemeral_idle_chat_is_not_assumed_safe_to_discard(self):
+        thread_id = next(iter(self.threads))
+        self.threads[thread_id].update(ephemeral=True, name=None, preview="", path=None,
+                                       status={"type": "idle"})
+        with self.assertRaises(self.S.SwitchError):
+            self.S.switch("codex", self.profiles[1]["id"])
+        self.assertEqual(self.restarts, 0)
+
+    def test_temporary_chat_list_reaches_picker_at_eighty_columns(self):
+        thread_id = next(iter(self.threads))
+        self.threads[thread_id].update(ephemeral=True, name=None, cwd="/work/setupvibe")
+        texts, _ = self.picker([10, 27], width=80)
+        self.assertTrue(any(f"[1] setupvibe: Untitled ({thread_id[:8]})" in text
+                            for text in texts))
+        self.assertEqual(self.restarts, 0)
+
+    def test_all_temporary_chats_are_numbered_in_stable_order(self):
+        for number, thread_id in enumerate(sorted(self.threads)):
+            self.threads[thread_id].update(ephemeral=True, name=f"Draft {number}", cwd="/work/project")
+        with self.assertRaises(self.S.SwitchError) as caught:
+            self.S.switch("codex", self.profiles[1]["id"])
+        message = str(caught.exception)
+        for number, thread_id in enumerate(sorted(self.threads), start=1):
+            self.assertIn(f"[{number}] project: Draft {number - 1} ({thread_id[:8]})", message)
+        self.assertIn("2 temporary Codex chats", message)
+        self.assertEqual(self.restarts, 0)
+
+    def test_persisted_chats_are_not_included_in_temporary_list(self):
+        first, second = sorted(self.threads)
+        self.threads[first].update(ephemeral=False, name="Saved chat")
+        self.threads[second].update(ephemeral=True, name="Draft", cwd="/work/project")
+        with self.assertRaises(self.S.SwitchError) as caught:
+            self.S.switch("codex", self.profiles[1]["id"])
+        message = str(caught.exception)
+        self.assertIn("1 temporary Codex chat;", message)
+        self.assertIn(f"[1] project: Draft ({second[:8]})", message)
+        self.assertNotIn("Saved chat", message)
+        self.assertNotIn(first[:8], message)
+
+    def test_force_discards_only_confirmed_temporary_chats_and_preserves_saved_chats(self):
+        saved = copy.deepcopy(self.threads)
+        temporary_id = str(uuid.uuid4())
+        self.threads[temporary_id] = {"name": "Draft", "cwd": self.temp.name, "ephemeral": True}
+        with self.assertRaises(self.S.TemporaryChatsError) as blocked:
+            self.S.switch("codex", self.profiles[1]["id"])
+        result = self.S.switch("codex", self.profiles[1]["id"],
+                               discard_temporary=blocked.exception.thread_ids)
+        self.assertEqual(self.threads, saved)
+        self.assertEqual(self.restarts, 1)
+        self.assertEqual(self.server_payload, self.profiles[1]["payload"])
+        self.assertIn("2 chats reloaded", result)
+        self.assertIn("1 temporary chat closed", result)
+        self.assertFalse(any(method in ("thread/delete", "thread/archive", "thread/unsubscribe")
+                             for method, _ in self.methods))
+
+    def test_force_requires_new_confirmation_for_a_new_temporary_chat(self):
+        temporary_id = str(uuid.uuid4())
+        self.threads[temporary_id] = {"name": "Draft", "cwd": self.temp.name, "ephemeral": True}
+        with self.assertRaises(self.S.TemporaryChatsError) as blocked:
+            self.S.switch("codex", self.profiles[1]["id"])
+        new_id = str(uuid.uuid4())
+        self.threads[new_id] = {"name": "New draft", "cwd": self.temp.name, "ephemeral": True}
+        with self.assertRaises(self.S.TemporaryChatsError) as refreshed:
+            self.S.switch("codex", self.profiles[1]["id"],
+                          discard_temporary=blocked.exception.thread_ids)
+        self.assertEqual(set(refreshed.exception.thread_ids), {temporary_id, new_id})
+        self.assertEqual(self.restarts, 0)
+        self.assertEqual(self.S.BACKENDS["codex"].read_live(), self.profiles[0]["payload"])
+
+    def test_force_rechecks_after_target_auth_verification_before_writing(self):
+        temporary_id = str(uuid.uuid4())
+        self.threads[temporary_id] = {"name": "Draft", "cwd": self.temp.name, "ephemeral": True}
+        def verify(kind, profile):
+            self.threads[str(uuid.uuid4())] = {"name": "New draft", "cwd": self.temp.name, "ephemeral": True}
+            return profile["payload"]
+        self.S.proven_payload = verify
+        with self.assertRaises(self.S.TemporaryChatsError):
+            self.S.switch("codex", self.profiles[1]["id"], discard_temporary=[temporary_id])
+        self.assertEqual(self.restarts, 0)
+        self.assertEqual(self.S.BACKENDS["codex"].read_live(), self.profiles[0]["payload"])
+
+    def test_new_temporary_chat_before_restart_restores_login_and_requests_confirmation(self):
+        temporary_id = str(uuid.uuid4())
+        new_id = str(uuid.uuid4())
+        self.threads[temporary_id] = {"name": "Draft", "cwd": self.temp.name, "ephemeral": True}
+        backend = self.S.BACKENDS["codex"]
+        write = backend.write_live
+        def concurrent_chat(payload):
+            write(payload)
+            self.threads[new_id] = {"name": "New draft", "cwd": self.temp.name, "ephemeral": True}
+        backend.write_live = concurrent_chat
+        with self.assertRaises(self.S.TemporaryChatsError) as blocked:
+            self.S.switch("codex", self.profiles[1]["id"], discard_temporary=[temporary_id])
+        self.assertEqual(set(blocked.exception.thread_ids), {temporary_id, new_id})
+        self.assertEqual(self.restarts, 0)
+        self.assertEqual(backend.read_live(), self.profiles[0]["payload"])
+        self.assertEqual(self.S._selection()["codex"], self.profiles[0]["id"])
+
+    def test_forced_switch_failure_reports_irreversible_loss_after_rollback(self):
+        temporary_id = str(uuid.uuid4())
+        self.threads[temporary_id] = {"name": "Draft", "cwd": self.temp.name, "ephemeral": True}
+        self.wrong_account = True
+        with self.assertRaises(self.S.SwitchError) as failed:
+            self.S.switch("codex", self.profiles[1]["id"], discard_temporary=[temporary_id])
+        self.assertIn("previous login restored", str(failed.exception))
+        self.assertIn("temporary chats may already be closed", str(failed.exception))
+        self.assertNotIn(temporary_id, self.threads)
+        self.assertEqual(self.restarts, 2)
+        self.assertEqual(self.server_payload, self.profiles[0]["payload"])
+
+    def test_forced_switch_failed_rollback_also_warns_about_temporary_chats(self):
+        temporary_id = str(uuid.uuid4())
+        self.threads[temporary_id] = {"name": "Draft", "cwd": self.temp.name, "ephemeral": True}
+        command = self.S._run
+        def refused(argv, **kwargs):
+            if argv[-1] == "restart":
+                self.restarts += 1
+                return subprocess.CompletedProcess(argv, 1, "", "confidential details")
+            return command(argv, **kwargs)
+        self.S._run = refused
+        with self.assertRaises(self.S.SwitchError) as failed:
+            self.S.switch("codex", self.profiles[1]["id"], discard_temporary=[temporary_id])
+        self.assertIn("could not be confirmed", str(failed.exception))
+        self.assertIn("temporary chats may already be closed", str(failed.exception))
+        self.assertNotIn("confidential", str(failed.exception))
+
+    def test_force_preserves_a_confirmed_chat_that_became_persistent(self):
+        temporary_id = str(uuid.uuid4())
+        self.threads[temporary_id] = {"name": "Now saved", "cwd": self.temp.name, "ephemeral": False}
+        result = self.S.switch("codex", self.profiles[1]["id"], discard_temporary=[temporary_id])
+        self.assertIn(temporary_id, self.threads)
+        self.assertIn("3 chats reloaded", result)
+
+    def test_force_without_a_running_daemon_only_installs_future_login(self):
+        self.running = False
+        self.S.switch("codex", self.profiles[1]["id"], discard_temporary=[str(uuid.uuid4())])
+        self.assertEqual(self.restarts, 0)
 
     def test_switching_same_saved_account_still_clears_unconfirmed_cache(self):
         self.server_payload = self.profiles[1]["payload"]
@@ -247,6 +426,7 @@ class MachineSwitch(unittest.TestCase):
     def picker(self, answer, action=10, width=120):
         texts, coordinates = [], []
         keys = iter([258, action, ord("q")])
+        answers = iter(answer) if isinstance(answer, list) else None
         class Screen:
             def getmaxyx(self): return (30, width)
             def timeout(self, *a): pass
@@ -259,7 +439,9 @@ class MachineSwitch(unittest.TestCase):
             def addnstr(self, y, x, text, count, *a): texts.append(text[:count])
             def getch(self): return next(keys)
         class Dialog(Screen):
-            def getch(self): return answer if isinstance(answer, int) else ord(answer)
+            def getch(self):
+                value = next(answers) if answers is not None else answer
+                return value if isinstance(value, int) else ord(value)
         def newwin(*args):
             coordinates.append(args)
             return Dialog()

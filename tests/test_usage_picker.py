@@ -149,6 +149,77 @@ class UsagePicker(unittest.TestCase):
         switch.assert_not_called()
         self.assertTrue(any("Echo" in text for text in frames[-1]["selected"]))
 
+    def test_temporary_chat_notice_lists_every_blocker_and_dismisses_without_switching(self):
+        error = self.S.TemporaryChatsError([
+            {"id": "00000001-0000-4000-8000-000000000001", "name": "Draft one", "cwd": "/work/api"},
+            {"id": "00000002-0000-4000-8000-000000000002", "name": None, "cwd": "/work/setupvibe"},
+            {"id": "00000003-0000-4000-8000-000000000003", "name": "Draft three", "cwd": "/work/web"},
+        ])
+        with patch.object(self.S, "switch", side_effect=error) as switch:
+            frames = self.picker([10, 10, 27, 27], height=18, width=80)
+        switch.assert_called_once()
+        notice = [f for f in frames if f["modal"]
+                  and any("Temporary Codex chats" in text for text in f["lines"].values())]
+        self.assertTrue(notice)
+        text = " ".join(notice[0]["lines"].values())
+        self.assertIn("[1] api: Draft one (00000001)", text)
+        self.assertIn("[2] setupvibe: Untitled (00000002)", text)
+        self.assertIn("[3] web: Draft three (00000003)", text)
+        self.assertIn("Force closes these chats and switches account.", text)
+        self.assertIn("Unsaved content will be lost.", text)
+        self.assertIn("3 temporary Codex chats; account unchanged", frames[-1]["lines"][17])
+
+    def test_temporary_chat_notice_scrolls_all_entries_in_a_short_terminal(self):
+        error = self.S.TemporaryChatsError([
+            {"id": f"{number:08d}-0000-4000-8000-000000000001", "name": f"Draft {number}",
+             "cwd": "/work/api"} for number in range(1, 13)])
+        with patch.object(self.S, "switch", side_effect=error):
+            frames = self.picker([10, 10] + [258] * 20 + [27, 27], height=12, width=80)
+        notices = [f for f in frames if f["modal"]
+                   and any("Temporary Codex chats" in text for text in f["lines"].values())]
+        text = " ".join(line for f in notices for line in f["lines"].values())
+        for number in range(1, 13):
+            self.assertIn(f"[{number}] api: Draft {number}", text)
+        self.assertIn("Unsaved content will be lost.", text)
+        self.assertIn("↑/↓ scroll", text)
+
+    def test_temporary_chat_notice_force_and_escape_are_clickable(self):
+        error = self.S.TemporaryChatsError([
+            {"id": "00000001-0000-4000-8000-000000000001", "name": None, "cwd": "/work/api"}])
+        for button in ("force", "esc"):
+            with self.subTest(button=button), \
+                    patch.object(self.S, "switch", side_effect=[error, "Switched; 1 temporary chat closed"]) as switch:
+                frames = self.picker([10, 10, ("click", button, 0, 4), 27], height=18, width=80)
+            self.assertEqual(switch.call_count, 2 if button == "force" else 1)
+            if button == "force":
+                self.assertEqual(switch.call_args.kwargs, {"discard_temporary": error.thread_ids})
+                self.assertIn("Switched; 1 temporary chat closed", frames[-1]["lines"][17])
+            else:
+                self.assertIn("1 temporary Codex chat; account unchanged", frames[-1]["lines"][17])
+
+    def test_temporary_chat_force_requires_f_and_enter_does_not_discard(self):
+        error = self.S.TemporaryChatsError([
+            {"id": "00000001-0000-4000-8000-000000000001", "name": None, "cwd": "/work/api"}])
+        with patch.object(self.S, "switch", side_effect=error) as switch:
+            self.picker([10, 10, 10, 27, 27], height=18, width=80)
+        switch.assert_called_once()
+        with patch.object(self.S, "switch", side_effect=[error, "Switched"]) as switch:
+            self.picker([10, 10, ord("f"), 27], height=18, width=80)
+        self.assertEqual(switch.call_count, 2)
+        self.assertEqual(switch.call_args.kwargs, {"discard_temporary": error.thread_ids})
+
+    def test_temporary_force_reopens_list_if_new_blockers_appear(self):
+        first = {"id": "00000001-0000-4000-8000-000000000001", "name": None, "cwd": "/work/api"}
+        second = {"id": "00000002-0000-4000-8000-000000000002", "name": "New draft", "cwd": "/work/api"}
+        error, changed = self.S.TemporaryChatsError([first]), self.S.TemporaryChatsError([first, second])
+        with patch.object(self.S, "switch", side_effect=[error, changed, "Switched"]) as switch:
+            frames = self.picker([10, 10, ord("f"), ord("f"), 27], height=18, width=80)
+        self.assertEqual(switch.call_count, 3)
+        self.assertEqual(switch.call_args_list[1].kwargs, {"discard_temporary": error.thread_ids})
+        self.assertEqual(switch.call_args_list[2].kwargs, {"discard_temporary": changed.thread_ids})
+        text = " ".join(line for f in frames if f["modal"] for line in f["lines"].values())
+        self.assertIn("[2] api: New draft", text)
+
     def test_mouse_reset_uses_clicked_account_and_nearest_expiry_after_confirmation(self):
         posts, _ = self.reset_provider()
         frames = self.picker([("Bravo", 45, 4), 10, 27], height=14)
