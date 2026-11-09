@@ -136,3 +136,38 @@ preserved saved chats, sanitized labels, short terminals, scrolling, mouse/`f`
 confirmation and ignored Enter. The optional native runtime test also creates
 an ephemeral thread with fictitious credentials before a forced account switch
 and verifies its disappearance while the two saved native chats reconnect.
+
+# Applying a current-account re-login (2026-11-09)
+
+A fictitious re-login reproduced the reported recovery problem: `login_codex`
+saved the new grant under the existing UUID, but left both the shared auth file
+and the daemon's authentication unchanged. Applying that same UUID through
+`switch()` installed the new grant and reloaded both saved chats. Switching to
+another account first was unnecessary. This explains recovery after re-login;
+it does not establish what originally invalidated a provider's credentials.
+
+The picker now captures the live login before starting an existing account's
+sign-in. Automatic application requires that the displayed current UUID, person,
+and workspace match that registration. After successful sign-in and terminal
+restoration, it uses the same UI switch path as Enter, including daemon progress,
+temporary-chat Force confirmation, saved-chat verification, and rollback.
+Reauthenticating an inactive account and adding an account remain save-only.
+The standalone `codex-login` command retains its explicit save/apply steps.
+
+The switch transaction checks the original live grant under its store lock and
+again after provider verification, before credential writes. A different account,
+logout, or new sign-in cancels automatic application; normal token rotation of
+the original grant is accepted. The guard is retained across Force retries.
+An explicit re-login's new saved grant is not replaced with the old live tokens
+when the person and session metadata happen to match. Failed or cancelled
+application keeps the completed saved login and reports that reload did not
+complete. These checks do not create an atomic transaction with external CLI
+writers; the scope and limitations of the existing switch still apply.
+
+`tests/test_codex_machine.py` exercises the picker with fictitious sign-ins and
+a simulated daemon, covering current/inactive accounts, interrupted sign-in,
+changed live accounts/grants, workspace mismatches, normal token rotation,
+no daemon, restart failure, and explicit temporary-chat discard/cancellation.
+The optional native runtime test additionally replaces a current account's
+grant through the guarded switch, verifying the new auth file and unchanged
+saved-chat IDs, titles, directories, and native clients after daemon restart.

@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.5.1 - 2026-11-09
+
+### Fixed
+
+- Apply a completed picker re-login automatically when it belongs to the
+  current Codex account, reloading saved chats through the existing daemon
+  restart and verification flow. Reauthenticating another account only updates
+  its saved registration.
+- Cancel automatic application if the active login changes during sign-in,
+  provider verification, or a temporary-chat confirmation. Retain the new saved
+  login for explicit application and keep temporary-chat discard behind Force.
+- Preserve freshly saved re-login credentials instead of replacing them with
+  the old live tokens when their account and session metadata match.
+
+### Maintenance
+
+- Share picker application, progress, failure handling, and Force confirmation
+  between explicit account switching and current-account reauthentication.
+- Cover active and inactive re-login, concurrent account changes, cancellation,
+  normal token rotation, workspace mismatches, absent daemons, and failed reloads
+  with fictitious credentials. Extend the native Codex test to verify a guarded
+  current-account reload while preserving saved-chat IDs, titles, and directories.
+- Document automatic picker reload and the explicit save/apply behavior of the
+  standalone sign-in command.
+
 ## 0.5.0 - 2026-10-23
 
 ### Added

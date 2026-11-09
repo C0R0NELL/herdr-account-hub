@@ -132,6 +132,187 @@ class MachineSwitch(unittest.TestCase):
         self.assertEqual(self.restarts, 0)
         self.assertEqual(self.S.BACKENDS["codex"].read_live(), self.profiles[2]["payload"])
 
+    def sign_in_again(self, index, *, during_login=None):
+        fresh = login(("one", "two", "three")[index], "new-login", "new-session")
+        def official_login(kind, argv, environment, directory):
+            if during_login:
+                during_login()
+            Path(directory, "auth.json").write_text(json.dumps(fresh["auth"]))
+        return fresh, patch.object(self.S, "_run_official_login", side_effect=official_login)
+
+    def test_picker_relogin_current_account_applies_fresh_login_and_reloads_saved_chats(self):
+        profile = self.profiles[1]
+        self.S.BACKENDS["codex"].write_live(profile["payload"])
+        self.S._select_profile("codex", profile["id"])
+        self.server_payload = copy.deepcopy(profile["payload"])
+        before = copy.deepcopy(self.threads)
+        fresh, sign_in = self.sign_in_again(1)
+        with sign_in:
+            texts, _ = self.picker(10, action=ord("a"))
+        self.assertEqual(self.restarts, 1)
+        self.assertEqual(self.server_payload, fresh)
+        self.assertEqual(self.S.BACKENDS["codex"].read_live(), fresh)
+        self.assertEqual(self.S.get_profile("codex", profile["id"])["payload"], fresh)
+        self.assertEqual(self.threads, before)
+        self.assertTrue(any("2 chats reloaded" in text for text in texts))
+
+    def test_picker_relogin_another_account_only_saves_its_login(self):
+        fresh, sign_in = self.sign_in_again(1)
+        with sign_in:
+            self.picker(10, action=ord("a"))
+        self.assertEqual(self.restarts, 0)
+        self.assertEqual(self.S.BACKENDS["codex"].read_live(), self.profiles[0]["payload"])
+        self.assertEqual(self.S.get_profile("codex", self.profiles[1]["id"])["payload"], fresh)
+        self.assertEqual(self.S._selection()["codex"], self.profiles[0]["id"])
+
+    def test_picker_relogin_does_not_replace_an_account_changed_during_sign_in(self):
+        self.S.BACKENDS["codex"].write_live(self.profiles[1]["payload"])
+        self.S._select_profile("codex", self.profiles[1]["id"])
+        def change_account():
+            self.S.BACKENDS["codex"].write_live(self.profiles[2]["payload"])
+            self.S._select_profile("codex", self.profiles[2]["id"])
+        fresh, sign_in = self.sign_in_again(1, during_login=change_account)
+        with sign_in:
+            texts, _ = self.picker(10, action=ord("a"))
+        self.assertEqual(self.restarts, 0)
+        self.assertEqual(self.S.BACKENDS["codex"].read_live(), self.profiles[2]["payload"])
+        self.assertEqual(self.S._selection()["codex"], self.profiles[2]["id"])
+        self.assertEqual(self.S.get_profile("codex", self.profiles[1]["id"])["payload"], fresh)
+        self.assertTrue(any("saved" in text and "cancelled" in text for text in texts))
+
+    def test_picker_relogin_temporary_chat_still_requires_explicit_force(self):
+        self.S.BACKENDS["codex"].write_live(self.profiles[1]["payload"])
+        self.S._select_profile("codex", self.profiles[1]["id"])
+        temporary_id = str(uuid.uuid4())
+        self.threads[temporary_id] = {"name": "Unsaved", "cwd": self.temp.name, "ephemeral": True}
+        fresh, sign_in = self.sign_in_again(1)
+        with sign_in:
+            texts, _ = self.picker([10, 27], action=ord("a"))
+        self.assertEqual(self.restarts, 0)
+        self.assertIn(temporary_id, self.threads)
+        self.assertEqual(self.S.BACKENDS["codex"].read_live(), self.profiles[1]["payload"])
+        self.assertEqual(self.S.get_profile("codex", self.profiles[1]["id"])["payload"], fresh)
+        self.assertTrue(any("force (f) | esc" in text for text in texts))
+
+    def test_picker_relogin_force_applies_new_login_and_preserves_saved_chats(self):
+        self.S.BACKENDS["codex"].write_live(self.profiles[1]["payload"])
+        self.S._select_profile("codex", self.profiles[1]["id"])
+        before = copy.deepcopy(self.threads)
+        temporary_id = str(uuid.uuid4())
+        self.threads[temporary_id] = {"name": "Unsaved", "cwd": self.temp.name, "ephemeral": True}
+        fresh, sign_in = self.sign_in_again(1)
+        with sign_in:
+            self.picker([10, ord("f")], action=ord("a"))
+        self.assertEqual(self.restarts, 1)
+        self.assertEqual(self.server_payload, fresh)
+        self.assertEqual(self.threads, before)
+
+    def test_picker_relogin_force_rechecks_account_changed_while_dialog_is_open(self):
+        self.S.BACKENDS["codex"].write_live(self.profiles[1]["payload"])
+        self.S._select_profile("codex", self.profiles[1]["id"])
+        temporary_id = str(uuid.uuid4())
+        self.threads[temporary_id] = {"name": "Unsaved", "cwd": self.temp.name, "ephemeral": True}
+        def confirm_after_change(*args):
+            self.S.BACKENDS["codex"].write_live(self.profiles[2]["payload"])
+            self.S._select_profile("codex", self.profiles[2]["id"])
+            return True
+        fresh, sign_in = self.sign_in_again(1)
+        with sign_in, patch.object(self.S, "_temporary_chats_notice", side_effect=confirm_after_change):
+            self.picker(10, action=ord("a"))
+        self.assertEqual(self.restarts, 0)
+        self.assertIn(temporary_id, self.threads)
+        self.assertEqual(self.S.BACKENDS["codex"].read_live(), self.profiles[2]["payload"])
+        self.assertEqual(self.S._selection()["codex"], self.profiles[2]["id"])
+        self.assertEqual(self.S.get_profile("codex", self.profiles[1]["id"])["payload"], fresh)
+
+    def test_guarded_reload_does_not_replace_fresh_saved_login_with_old_live_tokens(self):
+        old = copy.deepcopy(self.profiles[0]["payload"])
+        fresh = login("one", "fresh", "one")
+        profile = self.S.get_profile("codex", self.profiles[0]["id"])
+        profile["payload"] = fresh
+        self.S.write_profile(profile)
+        self.S.switch("codex", profile["id"], expected_live=old)
+        self.assertEqual(self.server_payload, fresh)
+
+    def test_guarded_reload_rechecks_active_login_after_provider_verification(self):
+        old = copy.deepcopy(self.profiles[0]["payload"])
+        def verify(kind, profile):
+            self.S.BACKENDS["codex"].write_live(self.profiles[2]["payload"])
+            return profile["payload"]
+        self.S.proven_payload = verify
+        with self.assertRaises(self.S.SwitchError):
+            self.S.switch("codex", self.profiles[0]["id"], expected_live=old)
+        self.assertEqual(self.restarts, 0)
+        self.assertEqual(self.S.BACKENDS["codex"].read_live(), self.profiles[2]["payload"])
+
+    def test_picker_relogin_without_daemon_updates_current_login_without_starting_one(self):
+        self.running = False
+        self.S.BACKENDS["codex"].write_live(self.profiles[1]["payload"])
+        fresh, sign_in = self.sign_in_again(1)
+        with sign_in:
+            self.picker(10, action=ord("a"))
+        self.assertEqual(self.restarts, 0)
+        self.assertEqual(self.S.BACKENDS["codex"].read_live(), fresh)
+
+    def test_picker_failed_relogin_does_not_reload_or_change_current_credentials(self):
+        self.S.BACKENDS["codex"].write_live(self.profiles[1]["payload"])
+        self.S._select_profile("codex", self.profiles[1]["id"])
+        before = self.S.get_profile("codex", self.profiles[1]["id"])
+        with patch.object(self.S, "_run_official_login", side_effect=self.S.SwitchError("sign-in cancelled")):
+            texts, _ = self.picker(10, action=ord("a"))
+        self.assertEqual(self.restarts, 0)
+        self.assertEqual(self.S.BACKENDS["codex"].read_live(), before["payload"])
+        self.assertEqual(self.S.get_profile("codex", before["id"]), before)
+        self.assertTrue(any("sign-in cancelled" in text for text in texts))
+
+    def test_picker_relogin_failed_reload_keeps_new_saved_login_and_reports_failure(self):
+        self.S.BACKENDS["codex"].write_live(self.profiles[1]["payload"])
+        self.S._select_profile("codex", self.profiles[1]["id"])
+        self.fail_restart = True
+        fresh, sign_in = self.sign_in_again(1)
+        with sign_in:
+            texts, _ = self.picker(10, action=ord("a"))
+        self.assertEqual(self.restarts, 2)
+        self.assertEqual(self.S.get_profile("codex", self.profiles[1]["id"])["payload"], fresh)
+        self.assertTrue(any("new login saved" in text and "could not restart" in text for text in texts))
+
+    def test_picker_relogin_does_not_reload_a_different_workspace_with_same_email(self):
+        profile = self.profiles[1]
+        live = copy.deepcopy(profile["payload"])
+        live["auth"]["tokens"]["account_id"] = "another-workspace"
+        self.S.BACKENDS["codex"].write_live(live)
+        fresh, sign_in = self.sign_in_again(1)
+        with sign_in:
+            self.picker(10, action=ord("a"))
+        self.assertEqual(self.restarts, 0)
+        self.assertEqual(self.S.BACKENDS["codex"].read_live(), live)
+        self.assertEqual(self.S.get_profile("codex", profile["id"])["payload"], fresh)
+
+    def test_guarded_reload_accepts_normal_token_rotation_within_original_login(self):
+        expected = copy.deepcopy(self.profiles[0]["payload"])
+        self.S.BACKENDS["codex"].write_live(login("one", "rotated-by-codex", "one"))
+        profile = self.S.get_profile("codex", self.profiles[0]["id"])
+        profile["payload"] = login("one", "new-login", "new-session")
+        self.S.write_profile(profile)
+        self.S.switch("codex", profile["id"], expected_live=expected)
+        self.assertEqual(self.server_payload, profile["payload"])
+
+    def test_guarded_reload_refuses_new_login_for_same_person_during_sign_in(self):
+        expected = copy.deepcopy(self.profiles[0]["payload"])
+        external = login("one", "external-login", "another-session")
+        self.S.BACKENDS["codex"].write_live(external)
+        with self.assertRaises(self.S.SwitchError):
+            self.S.switch("codex", self.profiles[0]["id"], expected_live=expected)
+        self.assertEqual(self.restarts, 0)
+        self.assertEqual(self.S.BACKENDS["codex"].read_live(), external)
+
+    def test_guarded_reload_cannot_automatically_apply_another_person(self):
+        expected = copy.deepcopy(self.profiles[0]["payload"])
+        with self.assertRaises(self.S.SwitchError):
+            self.S.switch("codex", self.profiles[1]["id"], expected_live=expected)
+        self.assertEqual(self.restarts, 0)
+        self.assertEqual(self.S.BACKENDS["codex"].read_live(), expected)
+
     def test_temporary_chat_refusal_identifies_title_directory_and_id_before_writes(self):
         thread_id = next(iter(self.threads))
         thread = self.threads[thread_id]

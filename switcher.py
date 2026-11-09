@@ -1085,7 +1085,17 @@ def _backup(kind, payload):
 
 # ---- the switch itself ----------------------------------------------------
 
-def switch(kind, key, *, discard_temporary=()):
+def _check_relogin_account(kind, expected_live, live, target):
+    """Automatic application can only repair the originally active account."""
+    if expected_live is None:
+        return
+    backend = BACKENDS[kind]
+    if (kind != "codex" or not _same_login(kind, {"payload": expected_live}, live)
+            or _fingerprint(backend.identity(expected_live)) != _fingerprint(backend.identity(target))):
+        raise SwitchError("Active login changed; automatic reload cancelled. Press Enter to apply the saved login.")
+
+
+def switch(kind, key, *, discard_temporary=(), expected_live=None):
     """Apply a saved account; Codex uses one account for this machine's home."""
     backend = BACKENDS[kind]
     with _Lock():
@@ -1093,12 +1103,13 @@ def switch(kind, key, *, discard_temporary=()):
         if target is None:
             raise SwitchError(f"no {kind} profile named {key!r}")
         live = backend.read_live()
+        _check_relogin_account(kind, expected_live, live, target["payload"])
         outgoing = _selected_login_profile(kind, live) if live is not None else None
         runtime = backend.prepare_switch(discard_temporary=discard_temporary) if kind == "codex" else None
         if outgoing is not None and outgoing["id"] == target["id"] and runtime is None:
             sync_live_profile(kind, live)
             return f"{kind}: already on {target['label']}"
-        if kind == "codex" and outgoing and outgoing["id"] == target["id"]:
+        if kind == "codex" and outgoing and outgoing["id"] == target["id"] and expected_live is None:
             # Codex may already have rotated the selected login. Verify its
             # current credentials, never spend the older saved refresh token.
             sync_live_profile(kind, live)
@@ -1106,6 +1117,8 @@ def switch(kind, key, *, discard_temporary=()):
         target["payload"] = proven_payload(kind, target)
         if runtime:
             runtime.recheck()
+        if expected_live is not None:
+            _check_relogin_account(kind, expected_live, backend.read_live(), target["payload"])
 
         if live is not None:
             if outgoing is None and not _live_account_saved(kind, live):
@@ -3799,23 +3812,71 @@ def _temporary_chats_notice(stdscr, error):
         _restore_picker(stdscr)
 
 
+def _ui_apply_account(stdscr, kind, profile_id, *, expected_live=None):
+    """Use the switch transaction and its explicit temporary-chat consent."""
+    import curses
+    options = {"expected_live": expected_live} if expected_live is not None else {}
+    saved = "Codex: new login saved; " if expected_live is not None else ""
+    try:
+        while True:
+            if kind == "codex":
+                _sync_picker_size(stdscr)
+                h, w = stdscr.getmaxyx()
+                title = "Switching Codex account and reloading chats..."
+                note = "(Daemon may wait for active work)"
+                progress = title + " " + note
+                progress_width = _picker_footer_layout(w)[2]
+                progress_lines = ([progress] if len(progress) <= progress_width
+                                  else [title, note])[-h:]
+                for index, line in enumerate(progress_lines[:-1]):
+                    stdscr.addnstr(h - len(progress_lines) + index, 0,
+                                  line.ljust(w - 1), w - 1, curses.A_BOLD)
+                _picker_footer(stdscr, progress_lines[-1])
+            try:
+                return switch(kind, profile_id, **options)
+            except TemporaryChatsError as exc:
+                if not _temporary_chats_notice(stdscr, exc):
+                    return (saved + "reload cancelled; press Enter to apply"
+                            if saved else exc.summary)
+                options["discard_temporary"] = exc.thread_ids
+            except SwitchError as exc:
+                return saved + str(exc)
+    finally:
+        _sync_picker_size(stdscr)
+        stdscr.clearok(True)
+
+
 def _ui_login(stdscr, kind, profile_id=None, label=None):
     """Give the terminal to official sign-in, then restore the account picker."""
     import curses
+    reload_live = None
+    if kind == "codex" and profile_id:
+        with _Lock():
+            live = BACKENDS[kind].read_live()
+            current = active_profile(kind, live) if live is not None else None
+            if (current and current["id"] == profile_id
+                    and _fingerprint(current["identity"]) == _fingerprint(BACKENDS[kind].identity(live))):
+                reload_live = live
     curses.def_prog_mode()
     curses.endwin()
     try:
         print("\nAccount Hub — sign in to " + BACKENDS[kind].short)
-        print("Complete the official login below. Current account stays active.")
+        print("Complete the official login below. " + (
+            "The current account's chats will reload after sign-in."
+            if reload_live is not None else "Current account stays active."))
         print("Saved automatically | Ctrl+C cancels | 15-minute limit\n", flush=True)
         if kind == "codex":
-            return login_codex(profile_id=profile_id, label=label,
-                               browser=_setting("ACCOUNT_HUB_CODEX_LOGIN_METHOD") == "browser")
-        return login_claude(label=label)
+            message = login_codex(profile_id=profile_id, label=label,
+                                  browser=_setting("ACCOUNT_HUB_CODEX_LOGIN_METHOD") == "browser")
+        else:
+            message = login_claude(label=label)
     finally:
         curses.reset_prog_mode()
         curses.curs_set(0)
         _restore_picker(stdscr)
+    if reload_live is not None:
+        return _ui_apply_account(stdscr, kind, profile_id, expected_live=reload_live)
+    return message
 
 
 def _ui_codex_login(stdscr, profile_id=None, label=None):
@@ -4025,41 +4086,7 @@ def cmd_ui(argv):
                         if selected[1] == "codex" else None):
                     message = "Account change cancelled"
                     continue
-                try:
-                    if selected[1] == "codex":
-                        _sync_picker_size(stdscr)
-                        h, w = stdscr.getmaxyx()
-                        title = "Switching Codex account and reloading chats..."
-                        note = "(Daemon may wait for active work)"
-                        progress = title + " " + note
-                        progress_width = _picker_footer_layout(w)[2]
-                        progress_lines = ([progress] if len(progress) <= progress_width
-                                          else [title, note])[-h:]
-                        for index, line in enumerate(progress_lines[:-1]):
-                            stdscr.addnstr(h - len(progress_lines) + index, 0,
-                                          line.ljust(w - 1), w - 1, curses.A_BOLD)
-                        _picker_footer(stdscr, progress_lines[-1])
-                    message = switch(selected[1], profile["id"])
-                except TemporaryChatsError as exc:
-                    message = exc.summary
-                    blocked = exc
-                    while _temporary_chats_notice(stdscr, blocked):
-                        try:
-                            _picker_footer(stdscr, "Switching Codex account... (Daemon may wait for active work)")
-                            message = switch(selected[1], profile["id"],
-                                             discard_temporary=blocked.thread_ids)
-                            break
-                        except TemporaryChatsError as changed:
-                            blocked = changed
-                            message = changed.summary
-                        except SwitchError as failed:
-                            message = str(failed)
-                            break
-                except SwitchError as exc:
-                    message = str(exc)
-                finally:
-                    _sync_picker_size(stdscr)
-                    stdscr.clearok(True)
+                message = _ui_apply_account(stdscr, selected[1], profile["id"])
             elif ch == ord("u"):
                 provider = _choose(stdscr, "Add new account",
                                    [("codex", "Codex"), ("claude", "Claude (beta)")])
@@ -4107,7 +4134,7 @@ def cmd_ui(argv):
                 if profile["kind"] == "codex":
                     if _confirm(stdscr, "Sign in to Codex account",
                                 f"Sign in again to {profile['label']}?",
-                                "Use the official login. Apply with Enter afterwards."):
+                                "Reload chats automatically if this account is active."):
                         try:
                             message = _ui_codex_login(stdscr, profile_id=profile["id"])
                             usage_fetched = 0

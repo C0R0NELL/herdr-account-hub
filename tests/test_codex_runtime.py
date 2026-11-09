@@ -207,10 +207,23 @@ class RealCodexMachine(_RuntimeFixture):
                     self.assertIsNone(client.poll())
                     self.assertIn(b"OpenAI Codex", output)
                 rpc.close(); rpc = None
-                for index, profile in enumerate(self.profiles[1:]):
+                for index, profile in enumerate(self.profiles):
                     temporary_id = None
                     confirmed = ()
-                    if index == 1:
+                    expected = None
+                    if index == 0:
+                        # A staged re-login belongs to the current person but
+                        # must replace the old grant rather than syncing it back.
+                        expected = S.BACKENDS["codex"].read_live()
+                        profile = copy.deepcopy(profile)
+                        claims = S._jwt_claims(profile["payload"]["auth"]["tokens"]["id_token"])
+                        claims["sid"] = "fresh-current-login"
+                        encoded = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
+                        tokens = profile["payload"]["auth"]["tokens"]
+                        tokens["id_token"] = tokens["access_token"] = "fake." + encoded + ".fake"
+                        tokens["refresh_token"] = "fake-fresh-current-refresh"
+                        S.write_profile(profile)
+                    if index == 2:
                         info = daemon("version")
                         rpc = S.CodexRPC(info["socketPath"], S._codex_environment())
                         temporary = rpc.call("thread/start", {
@@ -222,7 +235,8 @@ class RealCodexMachine(_RuntimeFixture):
                             S.switch("codex", profile["id"])
                         confirmed = blocked.exception.thread_ids
                         self.assertIn(temporary_id, confirmed)
-                    message = S.switch("codex", profile["id"], discard_temporary=confirmed)
+                    message = S.switch("codex", profile["id"], discard_temporary=confirmed,
+                                       expected_live=expected)
                     self.assertIn("2 chats reloaded", message)
                     info = daemon("version")
                     rpc = S.CodexRPC(info["socketPath"], S._codex_environment())
@@ -238,6 +252,8 @@ class RealCodexMachine(_RuntimeFixture):
                         self.assertEqual({k: after.get(k) for k in ("id", "name", "cwd")},
                                          {k: prior.get(k) for k in ("id", "name", "cwd")})
                     self.assertEqual(S.codex_application_status(), "applied")
+                    if expected is not None:
+                        self.assertEqual(S.BACKENDS["codex"].read_live(), profile["payload"])
                     rpc.close(); rpc = None
                     pump(3)
                     for client, master, output in clients:

@@ -50,6 +50,13 @@ not replace saved credentials or repair a revoked login. To repair an existing
 Codex registration, select it and use the picker's sign-in action. That flow
 checks the person and workspace before replacing that UUID's credentials.
 
+When reauthenticating the current Codex account in the picker, a completed
+sign-in automatically applies the new login and reloads its chats. Other
+accounts only have their saved registration updated. If the active login changes
+during sign-in, automatic application is cancelled and the new saved login
+remains available for an explicit switch. Temporary chats still require Force
+confirmation; cancelling it keeps the saved login for later application.
+
 The current-account dot follows the email in the CLI's local login, even after
 signing in outside the plugin. This display lookup does not overwrite credentials
 or establish that an existing daemon has reloaded them. Token synchronization
@@ -71,6 +78,8 @@ python3 switcher.py codex-login PROFILE_UUID --browser
 
 `PROFILE_UUID` identifies a saved account. Labels may be duplicated, so use the
 UUID when addressing one registration explicitly.
+The scriptable `codex-login` command saves credentials; use `switch` to apply
+them. Automatic reload after reauthentication belongs to the picker flow.
 
 ## Codex switching
 
