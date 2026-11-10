@@ -36,6 +36,7 @@ import queue
 import random
 import re
 import signal
+import shutil
 import socket
 import stat
 import struct
@@ -1200,7 +1201,29 @@ def next_profile(kind):
 
 # ---- Codex machine-wide authentication reload -----------------------------
 
-CODEX = os.environ.get("ACCOUNT_HUB_CODEX_BIN", "codex")
+def _codex_bin_dirs():
+    """Bounded user/system install locations; never scan projects or versions."""
+    home = os.path.expanduser("~")
+    data = os.path.expanduser(os.environ.get("XDG_DATA_HOME") or os.path.join(home, ".local/share"))
+    directories = [os.environ.get("NVM_BIN"), os.environ.get("PNPM_HOME")]
+    directories.extend(os.path.join(home, suffix) for suffix in (
+        ".local/bin", ".npm-global/bin", ".volta/bin", ".bun/bin", ".cargo/bin", ".asdf/shims"))
+    directories.extend((os.path.join(data, "mise/shims"), "/opt/homebrew/bin",
+                        "/usr/local/bin", *os.defpath.split(os.pathsep)))
+    return list(dict.fromkeys(directory for directory in directories
+                              if directory and os.path.isabs(directory)))
+
+
+def _codex_binary():
+    configured = _setting("ACCOUNT_HUB_CODEX_BIN")
+    name = os.path.expanduser(configured) if isinstance(configured, str) and configured.strip() else "codex"
+    if os.path.dirname(name):
+        return os.path.abspath(name)
+    found = shutil.which(name) or shutil.which(name, path=os.pathsep.join(_codex_bin_dirs()))
+    return os.path.abspath(found) if found else name
+
+
+CODEX = _codex_binary()
 CODEX_APPLICATION = os.path.join(STATE_DIR, "codex-application.json")
 CODEX_RECONNECT_TIMEOUT_S = _num_env("ACCOUNT_HUB_CODEX_RECONNECT_TIMEOUT_S", 120.0)
 
@@ -1208,6 +1231,10 @@ CODEX_RECONNECT_TIMEOUT_S = _num_env("ACCOUNT_HUB_CODEX_RECONNECT_TIMEOUT_S", 12
 def _codex_environment():
     environment = os.environ.copy()
     environment["CODEX_HOME"] = BACKENDS["codex"].home
+    # npm/version-manager launchers may also need their sibling runtime. Keep
+    # the inherited runtime preference and repair only this child's search path.
+    directories = [environment.get("PATH"), os.path.dirname(CODEX), *_codex_bin_dirs()]
+    environment["PATH"] = os.pathsep.join(directory for directory in directories if directory)
     # Keep CODEX_SQLITE_HOME and the user's config (including sqlite_home).
     return environment
 
@@ -2893,8 +2920,9 @@ def _run_official_login(kind, argv, environment, directory):
         raise SwitchError(f"{title} sign-in timed out after 15 minutes; current account unchanged") from None
     except KeyboardInterrupt:
         raise SwitchError(f"{title} sign-in cancelled; current account unchanged") from None
-    except OSError:
-        raise SwitchError(f"Could not start {title} sign-in; check that its CLI is installed") from None
+    except OSError as exc:
+        code = errno.errorcode.get(exc.errno, "OS_ERROR")
+        raise SwitchError(f"Could not start {title} sign-in ({code}); check the CLI path and permissions") from None
     if result.returncode:
         raise SwitchError(f"{title} sign-in did not complete; current account unchanged")
 

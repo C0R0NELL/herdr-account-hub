@@ -208,6 +208,34 @@ codex_login_method = "browser"
 usage_renew = false
 ```
 
+Codex executable selection respects an explicit setting first, then the picker's
+`PATH`, then common user and system installation directories. These include
+`~/.local/bin`, `~/.npm-global/bin`, common version-manager shims, XDG data
+locations, and Homebrew locations. Discovery uses the current user's home and
+does not execute shell startup files or search projects or arbitrary versions.
+Codex subprocesses keep their inherited runtime preference and append the
+launcher directory and fallback locations so npm launchers can find their runtime.
+This does not change Herdr's global environment.
+
+For a custom installation outside these locations, set its executable explicitly
+in this same file. Home-relative paths are supported:
+
+```toml
+codex_bin = "~/.npm-global/bin/codex"
+```
+
+Use the actual executable path on that machine. `ACCOUNT_HUB_CODEX_BIN` takes
+precedence over this option. Reopen the picker after changing it. Node.js is
+still required for npm launchers. As a one-launch workaround on older plugin
+versions, open a picker with your working terminal's `PATH`:
+
+```sh
+herdr plugin pane open --plugin c0r0nell.account-hub --entrypoint picker --placement overlay --env "PATH=$PATH"
+```
+
+Startup failures include a safe OS error code such as `ENOENT`, `EACCES`, or
+`ENOEXEC`, rather than assuming every failure means the CLI is uninstalled.
+
 An `ACCOUNT_HUB_` environment setting takes precedence over its matching lowercase
 configuration key. Herdr actions inherit the server's environment. Settings are
 loaded when the Python process starts; reopen the picker after editing them.

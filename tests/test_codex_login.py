@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Account registration must never revoke the shared Codex login."""
 import importlib.util
+import errno
 import json
 import os
 from pathlib import Path
@@ -57,6 +58,68 @@ class _LoginFixture(unittest.TestCase):
         return subprocess.CompletedProcess(argv, 0)
 
 class CodexLogin(_LoginFixture):
+    def test_user_npm_install_and_its_runtime_are_found_without_custom_configuration(self):
+        user_home = Path(self.temp.name, "portable user")
+        binaries = user_home / ".npm-global/bin"
+        binaries.mkdir(parents=True)
+        launcher = binaries / "codex"
+        launcher.write_text("#!/usr/bin/env account-hub-fixture-runtime\n")
+        launcher.chmod(0o700)
+        runtime = binaries / "account-hub-fixture-runtime"
+        runtime.write_text("#!" + sys.executable + "\nimport json, os\n"
+            "from pathlib import Path\n"
+            "path = Path(os.environ['CODEX_HOME']) / 'auth.json'\n"
+            "assert not path.exists(), 'login store must be empty'\n"
+            "path.write_text(" + repr(json.dumps(self.new["auth"])) + ")\n")
+        runtime.chmod(0o700)
+        restricted_path = Path(self.temp.name, "empty bin")
+        restricted_path.mkdir()
+        env = dict(os.environ, HOME=str(user_home), PATH=str(restricted_path))
+        env.pop("ACCOUNT_HUB_CODEX_BIN", None)
+        result = subprocess.run([sys.executable, "-B", str(Path(self.S.__file__)),
+            "codex-login", "--label", "Portable npm CLI", "--browser"],
+            env=env, capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        saved = next(p for p in self.S.list_profiles("codex") if p["label"] == "Portable npm CLI")
+        self.assertEqual(saved["payload"], self.new)
+        self.assertEqual(self.S.BACKENDS["codex"].read_live(), self.current)
+
+    def test_configured_executable_starts_sign_in_when_codex_is_missing_from_path(self):
+        executable = Path(self.temp.name, "external install", "codex runner")
+        executable.parent.mkdir()
+        executable.write_text("#!" + sys.executable + "\nimport json, os\n"
+            "from pathlib import Path\n"
+            "path = Path(os.environ['CODEX_HOME']) / 'auth.json'\n"
+            "assert not path.exists(), 'login store must be empty'\n"
+            "path.write_text(" + repr(json.dumps(self.new["auth"])) + ")\n")
+        executable.chmod(0o700)
+        config = Path(self.temp.name, "config", "config.toml")
+        config.parent.mkdir()
+        config.write_text('codex_bin = ' + json.dumps(str(executable)) + '\n')
+        restricted_path = Path(self.temp.name, "empty bin")
+        restricted_path.mkdir()
+        env = dict(os.environ, PATH=str(restricted_path))
+        env.pop("ACCOUNT_HUB_CODEX_BIN", None)
+        result = subprocess.run([sys.executable, "-B", str(Path(self.S.__file__)),
+            "codex-login", "--label", "Configured CLI", "--browser"],
+            env=env, capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        saved = next(p for p in self.S.list_profiles("codex") if p["label"] == "Configured CLI")
+        self.assertEqual(saved["payload"], self.new)
+        self.assertEqual(self.S.BACKENDS["codex"].read_live(), self.current)
+
+    def test_start_failure_reports_only_safe_os_error_code_and_preserves_login(self):
+        for number in (errno.ENOENT, errno.EACCES, errno.ENOEXEC):
+            with self.subTest(code=errno.errorcode[number]), patch.object(
+                    self.S.subprocess, "run", side_effect=OSError(number, "private diagnostic secret")):
+                with self.assertRaises(self.S.SwitchError) as caught:
+                    self.S.login_codex(label="Incomplete")
+            self.assertIn(errno.errorcode[number], str(caught.exception))
+            self.assertNotIn("private diagnostic secret", str(caught.exception))
+            self.assertEqual(self.S.BACKENDS["codex"].read_live(), self.current)
+            self.assertEqual(len(self.S.list_profiles("codex")), 1)
+            self.assertEqual(list(Path(self.S.STATE_DIR).glob("codex-login-*")), [])
+
     def test_add_new_skips_an_email_already_saved_without_replacing_it(self):
         self.new = login("one", "another-grant", "another-session")
         with patch.object(self.S.subprocess, "run", side_effect=self.official_login):

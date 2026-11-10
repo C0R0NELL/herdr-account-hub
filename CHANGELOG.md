@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.5.2 - 2026-11-10
+
+### Fixed
+
+- Find Codex in common current-user and system install directories when the
+  picker's inherited PATH cannot find it. Respect explicit configuration and
+  existing PATH choices, using portable HOME and XDG paths for fallback lookup.
+- Extend only Codex subprocess search paths with launcher and fallback
+  directories so npm and version-manager launchers can find their runtime,
+  preserving inherited runtime preference and Herdr's global environment.
+- Honor `codex_bin` in the plugin configuration, including home-relative paths,
+  while keeping `ACCOUNT_HUB_CODEX_BIN` as the higher-priority override.
+- Show safe OS error codes for sign-in launch failures instead of assuming the
+  CLI is uninstalled. Preserve existing logins when startup fails.
+
+### Maintenance
+
+- Add isolated subprocess regressions for automatic user npm discovery,
+  launcher/runtime lookup, configured paths containing spaces, PATH priority,
+  XDG locations, configuration precedence, and safe launch-error reporting.
+- Document portable discovery, custom installations, and the confirmed
+  picker-versus-terminal environment diagnosis.
+
 ## 0.5.1 - 2026-11-09
 
 ### Fixed

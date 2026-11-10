@@ -81,6 +81,36 @@ class Storage(unittest.TestCase):
         self.assertEqual(Path(S.CONFIG_DIR), self.base / "config/herdr/plugins/config" / OFFICIAL)
         self.assertFalse(Path(S.STATE_DIR).is_relative_to(self.root))
 
+    def test_codex_executable_respects_config_home_expansion_and_environment_priority(self):
+        config = self.base / "config/herdr/plugins/config" / OFFICIAL / "config.toml"
+        config.parent.mkdir(parents=True)
+        config.write_text('codex_bin = "~/.npm-global/bin/codex"\n')
+        self.assertEqual(self.load().CODEX, str(Path.home() / ".npm-global/bin/codex"))
+        self.assertEqual(self.load({"ACCOUNT_HUB_CODEX_BIN": "/explicit/codex"}).CODEX,
+                         "/explicit/codex")
+
+    def test_codex_discovery_keeps_path_choice_ahead_of_user_fallbacks(self):
+        user_home = self.base / "portable user"
+        fallback = user_home / ".npm-global/bin/codex"
+        preferred = self.base / "preferred bin/codex"
+        for executable in (fallback, preferred):
+            executable.parent.mkdir(parents=True)
+            executable.write_text("#!/bin/sh\nexit 0\n")
+            executable.chmod(0o700)
+        S = self.load({"HOME": str(user_home), "PATH": str(preferred.parent)})
+        self.assertEqual(S.CODEX, str(preferred))
+
+    def test_codex_discovery_respects_custom_xdg_data_location(self):
+        user_home = self.base / "portable user"
+        data = self.base / "portable data"
+        executable = data / "mise/shims/codex"
+        executable.parent.mkdir(parents=True)
+        executable.write_text("#!/bin/sh\nexit 0\n")
+        executable.chmod(0o700)
+        S = self.load({"HOME": str(user_home), "XDG_DATA_HOME": str(data),
+                       "PATH": str(self.base / "empty bin")})
+        self.assertEqual(S.CODEX, str(executable))
+
     def test_injected_herdr_directories_are_used_for_the_matching_plugin(self):
         state, config = self.base / "host-state", self.base / "host-config"
         S = self.load({"HERDR_PLUGIN_ID": OFFICIAL,
